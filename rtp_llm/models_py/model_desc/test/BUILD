@@ -102,3 +102,27 @@ py_test(
     tags = ["rocm"],
     exec_properties = {'gpu': 'MI308X-ROCM7', 'gpu_count': '1'},
 )
+
+py_test(
+    name = "qwen4_exp_layer_test",
+    srcs = ["qwen4_exp_layer_test.py"],
+    deps = py_test_deps + [
+        "//rtp_llm:testlib",
+        "//rtp_llm/models_py:models",
+        "//rtp_llm:config",
+    ],
+    env = {"GPU_COUNT": "1"},
+    exec_properties = {"gpu": "A10", "gpu_count": "1"},
+)
+
+py_test(
+    name = "qwen4_exp_mtp_test",
+    srcs = ["qwen4_exp_mtp_test.py"],
+    deps = py_test_deps + [
+        "//rtp_llm:testlib",
+        "//rtp_llm/models_py:models",
+        "//rtp_llm:config",
+    ],
+    env = {"GPU_COUNT": "1"},
+    exec_properties = {"gpu": "A10", "gpu_count": "1"},
+)

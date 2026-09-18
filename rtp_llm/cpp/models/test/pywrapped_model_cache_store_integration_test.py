@@ -51,6 +51,7 @@ run_dirty_generation_prefill_capture_scenario = (
     _extension.run_dirty_generation_prefill_capture_scenario
 )
 run_scenario = _extension.run_scenario
+run_speculative_commit_bridge = _extension.run_speculative_commit_bridge
 
 
 class CacheStoreForwardModel:
@@ -209,6 +210,52 @@ class UnsupportedBackendGenerationPrefillCaptureModel(
         return None
 
 
+class SpeculativeCommitBridgeModel:
+    def __init__(
+        self,
+        *,
+        prepare_error: bool = False,
+        commit_error: bool = False,
+        abort_error: bool = False,
+    ):
+        self.prepare_error = prepare_error
+        self.commit_error = commit_error
+        self.abort_error = abort_error
+        self.finish_calls: list[bool] = []
+        self.finalize_calls = 0
+
+    def initialize(self, resources) -> bool:
+        return True
+
+    def forward(self, inputs: PyModelInputs) -> PyModelOutputs:
+        raise AssertionError("bridge-only test must not execute forward")
+
+    def prepare_speculative_target_commit(self, accept_len: torch.Tensor) -> None:
+        if self.prepare_error:
+            raise RuntimeError("prepare bridge boom")
+
+    def finish_speculative_target_commit(self, commit: bool) -> None:
+        self.finish_calls.append(commit)
+        if commit and self.commit_error:
+            raise RuntimeError("commit bridge boom")
+        if not commit and self.abort_error:
+            raise RuntimeError("abort bridge boom")
+
+    def finalize_speculative_target_commit(self) -> None:
+        self.finalize_calls += 1
+
+
+class PrepareOnlySpeculativeCommitBridgeModel:
+    def initialize(self, resources) -> bool:
+        return True
+
+    def forward(self, inputs: PyModelInputs) -> PyModelOutputs:
+        raise AssertionError("bridge-only test must not execute forward")
+
+    def prepare_speculative_target_commit(self, accept_len: torch.Tensor) -> None:
+        pass
+
+
 def _blocks_by_key(result: dict) -> dict[str, dict]:
     return {
         block["key"]: block
@@ -312,6 +359,43 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
         self.assertEqual(model.prefill_forward_calls, 4)
         self.assertEqual(result["available_after"], result["available_before"])
         self.assertFalse(result["manager_retained"])
+
+    def test_speculative_commit_hooks_must_be_implemented_as_a_pair(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "must implement.*as a pair"):
+            run_speculative_commit_bridge(
+                PrepareOnlySpeculativeCommitBridgeModel(), "has_hooks"
+            )
+
+    def test_speculative_commit_prepare_exception_becomes_error(self) -> None:
+        model = SpeculativeCommitBridgeModel(prepare_error=True)
+
+        self.assertTrue(run_speculative_commit_bridge(model, "has_hooks"))
+        error = run_speculative_commit_bridge(model, "prepare")
+
+        self.assertIn("prepare bridge boom", error)
+
+    def test_speculative_commit_abort_exception_does_not_escape(self) -> None:
+        model = SpeculativeCommitBridgeModel(abort_error=True)
+
+        self.assertIsNone(run_speculative_commit_bridge(model, "abort"))
+        self.assertEqual(model.finish_calls, [False])
+
+    def test_speculative_commit_exception_becomes_error(self) -> None:
+        model = SpeculativeCommitBridgeModel(commit_error=True)
+
+        error = run_speculative_commit_bridge(model, "commit")
+
+        self.assertIn("commit bridge boom", error)
+        self.assertEqual(model.finish_calls, [True])
+
+    def test_non_target_wrapper_ignores_speculative_commit_hooks(self) -> None:
+        self.assertFalse(
+            run_speculative_commit_bridge(
+                PrepareOnlySpeculativeCommitBridgeModel(),
+                "has_hooks",
+                False,
+            )
+        )
 
     def test_multi_tag_uses_each_tag_local_physical_block_table(self) -> None:
         model = CacheStoreForwardModel()

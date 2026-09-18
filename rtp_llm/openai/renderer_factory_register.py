@@ -120,7 +120,14 @@ def _register_builtin_lazy_renderers() -> None:
         "rtp_llm.openai.renderers.qwen3_code_renderer",
     )
     register_lazy_renderer(
-        ["qwen35_moe", "qwen35_dense", "qwen35_moe_mtp"],
+        [
+            "qwen35_moe",
+            "qwen35_dense",
+            "qwen35_dense_mtp",
+            "qwen35_moe_mtp",
+            "qwen4_exp",
+            "qwen4_exp_mtp",
+        ],
         "rtp_llm.openai.renderers.qwen35_renderer",
     )
     register_lazy_renderer(
@@ -141,7 +148,14 @@ def _register_builtin_lazy_renderers() -> None:
         ["qwen_v2_audio"], "rtp_llm.openai.renderers.qwen_v2_audio_renderer"
     )
     register_lazy_renderer(
-        ["qwen_vl", "qwen_vl_1b8", "qwen2_vl", "qwen2_5_vl", "qwen3_vl", "qwen3_vl_moe"],
+        [
+            "qwen_vl",
+            "qwen_vl_1b8",
+            "qwen2_vl",
+            "qwen2_5_vl",
+            "qwen3_vl",
+            "qwen3_vl_moe",
+        ],
         "rtp_llm.openai.renderers.qwen_vl_renderer",
     )
 
