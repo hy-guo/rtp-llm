@@ -46,6 +46,22 @@ class TaggedBlockTableModel:
         return PyModelOutputs(inputs.input_hiddens + signature)
 
 
+class ExactBatchTaggedModel(TaggedBlockTableModel):
+    def prepare_fmha_impl(self, inputs: PyModelInputs, is_cuda_graph: bool = False):
+        self.assert_exact(inputs)
+        return None
+
+    @staticmethod
+    def assert_exact(inputs: PyModelInputs) -> None:
+        for tag, attn_inputs in inputs.attention_inputs.items():
+            if not attn_inputs.is_exact_cuda_graph_batch:
+                raise RuntimeError(f"exact batch metadata missing for {tag}")
+
+    def forward(self, inputs: PyModelInputs, fmha_impl=None) -> PyModelOutputs:
+        self.assert_exact(inputs)
+        return super().forward(inputs, fmha_impl)
+
+
 class TaggedPhysicalBlockTableModel(TaggedBlockTableModel):
     """Read allocator-page maps used by model-local side-cache kernels."""
 
@@ -487,6 +503,23 @@ def _build_target_verify_inputs(
 
 
 class TestCudaGraphTaggedCache(unittest.TestCase):
+    def test_exact_batch_metadata_reaches_initial_and_bucket_capture(self) -> None:
+        runner = CudaGraphRunner()
+        runner.init_decode(
+            ExactBatchTaggedModel(),
+            HIDDEN_SIZE,
+            TOKENS_PER_BLOCK,
+            TOKENS_PER_BLOCK,
+            TOKENS_PER_BLOCK,
+            [1, 2],
+            GROUP_TAGS,
+            exact_batch_only=True,
+        )
+        inputs = _build_decode_inputs(
+            GROUP_TAGS, {"full": 2, "aux": 1}, batch_size=1
+        )
+        self._assert_replay_signature(runner, inputs, 18)
+
     def _assert_replay_signature(
         self, runner: CudaGraphRunner, inputs: PyModelInputs, expected: int
     ) -> None:
