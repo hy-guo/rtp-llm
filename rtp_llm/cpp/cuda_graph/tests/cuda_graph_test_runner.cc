@@ -173,6 +173,12 @@ public:
         runner_->prepareAttentionInputs(inputs, state_);
     }
 
+    void updateBlockTables(torch_ext::PyModelInputs& inputs) {
+        c10::InferenceMode inference_guard(true);
+        prepareDeviceMirrors(inputs);
+        runner_->updateKVCacheKernelBlockId(inputs, state_);
+    }
+
     int getCurrentRealGraphSize() {
         return runner_ != nullptr ? runner_->getCurrentRealGraphSize(state_) : 0;
     }
@@ -259,6 +265,7 @@ PYBIND11_MODULE(libtest_cuda_graph_runner, m) {
         .def("prepare", &CudaGraphTestRunner::prepare, py::arg("inputs"), py::arg("skip_forward_event_sync") = false)
         .def("forward", &CudaGraphTestRunner::forward)
         .def("prepareAttentionInputs", &CudaGraphTestRunner::prepareAttentionInputs)
+        .def("updateBlockTables", &CudaGraphTestRunner::updateBlockTables)
         .def("getGenerationPrefillStatus", &CudaGraphTestRunner::getGenerationPrefillStatus)
         .def("getCurrentRealGraphSize", &CudaGraphTestRunner::getCurrentRealGraphSize)
         .def("captureSessionMayBeDirty", &CudaGraphTestRunner::captureSessionMayBeDirty);
