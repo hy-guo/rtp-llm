@@ -927,6 +927,11 @@ TEST_F(MtpExecutorTest, testSingleBatchPrefill) {
     draft_output.logits            = torch::tensor({0.5f, 0.6f, 0.7f, 0.8f}).reshape({(int64_t)batch_size, 4});
     draft_output.all_hidden_states =
         torch::tensor({0.11f, 0.12f, 0.13f, 0.14f, 0.15f, 0.16f, 0.17f, 0.18f}).reshape({4, 2});
+    // Draft prefill uses the output's own row count. The public MTP hidden
+    // tensor must replace the ordinary hidden states without requiring an
+    // explicit row count from the caller.
+    draft_output.mtp_target_hidden_states =
+        torch::tensor({0.21f, 0.22f, 0.23f, 0.24f, 0.25f, 0.26f, 0.27f, 0.28f}).reshape({4, 2});
 
     components.fake_draft_model->setInputs({draft_input});
     components.fake_draft_model->setOutputs({draft_output});
@@ -957,7 +962,7 @@ TEST_F(MtpExecutorTest, testSingleBatchPrefill) {
     ASSERT_TRUE(status.ok());
 
     // check stream result
-    checkOutput(stream1, {0, 1, 2, 3, 1}, {1, 2}, {0.0, 0.0, 1.0, 0.0}, {0.17, 0.18});
+    checkOutput(stream1, {0, 1, 2, 3, 1}, {1, 2}, {0.0, 0.0, 1.0, 0.0}, {0.27, 0.28});
 }
 
 TEST_F(MtpExecutorTest, testDSparkPrefillCommitDoesNotUseTargetVerifyContract) {
