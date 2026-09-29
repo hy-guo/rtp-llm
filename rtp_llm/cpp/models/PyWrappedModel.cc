@@ -1015,8 +1015,14 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
             && !is_generation_prefill_runner) {
             generation_prefill_cuda_graph_status = GenerationPrefillCudaGraphStatus::MIXED_PREFILL_DECODE_NOT_SUPPORTED;
         }
-        const bool can_run_graph =
+        const bool graph_candidate =
             enable_cuda_graph_ && graph_runner != nullptr && graph_runner->canRun(py_model_inputs, graph_state);
+        // The accept_len callback carries only live requests. Until padded
+        // speculative commits have a per-row mask, use exact batch graphs.
+        const bool can_run_graph = graph_candidate
+                                   && (!has_speculative_target_commit_hooks_
+                                       || !py_model_inputs.attention_inputs.is_target_verify
+                                       || graph_state.current_real_graph_bs == graph_state.current_batch_size);
         if (is_generation_prefill_runner && !can_run_graph) {
             generation_prefill_cuda_graph_status =
                 graph_state.generation_prefill_status == GenerationPrefillCudaGraphStatus::NOT_REQUESTED ?
@@ -1034,6 +1040,9 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
                 graph_state.current_real_graph_bs);
             py_model_inputs.attention_inputs.is_s_padded = true;
             py_model_outputs                             = graph_runner->forward(py_model_inputs, graph_state);
+            if (has_speculative_target_commit_hooks_ && py_model_inputs.attention_inputs.is_target_verify) {
+                py_model_.attr("activate_speculative_target_graph_replay")(graph_state.current_real_graph_bs);
+            }
             if (is_generation_prefill_runner) {
                 generation_prefill_cuda_graph_status = GenerationPrefillCudaGraphStatus::REPLAYED;
             }
