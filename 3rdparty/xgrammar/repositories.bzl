@@ -1,3 +1,4 @@
+load(":versions.bzl", "XGRAMMAR_SOURCE_COMMIT")
 load("@bazel_tools//tools/build_defs/repo:git.bzl", "new_git_repository")
 
 def xgrammar_deps():
@@ -5,7 +6,7 @@ def xgrammar_deps():
     new_git_repository(
         name = "xgrammar",
         remote = "https://github.com/mlc-ai/xgrammar.git",
-        commit = "60fc70ee4e0842eecc81fdd1941f778b1bd8107f",
+        commit = XGRAMMAR_SOURCE_COMMIT,
         init_submodules = False,
         build_file = str(Label("@rtp_llm//3rdparty/xgrammar:xgrammar.BUILD")),
     )

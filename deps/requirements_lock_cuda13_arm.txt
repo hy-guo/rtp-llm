@@ -4142,13 +4142,11 @@ websocket-client==1.9.0 \
     --hash=sha256:9e813624b6eb619999a97dc7958469217c3176312b3a16a4bd1bc7e08a46ec98 \
     --hash=sha256:af248a825037ef591efbf6ed20cc5faa03d3b47b9e5a2230a529eeee1c1fc3ef
     # via dashscope
-xgrammar==0.2.5 \
-    --hash=sha256:4833b7a5c267c64fe17e1bac5410f39c0555f7411d9cdc3d09bd07dee872c569 \
-    --hash=sha256:5c84032e8c67f5e02ea8e920ee0d12fc1fce47a3f6b69e3165b1e2264e9f2f18 \
-    --hash=sha256:69901bd7469127b59e22668a41efc25e9062a591b4596e5a8877fae18bd10832 \
-    --hash=sha256:7038525ffb1f3f2c5cf2dc200332e79f6f2fd836a106e7147d8c6b9c63d787a4 \
-    --hash=sha256:a0e49cfd0d447247c72f10505c7d6b84696296f68dd03ca294fc1d961db4e786
-    # via -r internal_source/deps/../../deps/requirements_base.txt
+xgrammar @ https://github.com/hy-guo/rtp-llm/releases/download/qwen4-exp-deps-20261008/xgrammar-0.2.3%2Brtp.60fc70ee.tar.gz \
+    --hash=sha256:c630a8fa70d1d1f30a31ccbdd4c0a14b3540c45d0a314c49cbb8678df88ae33d
+    # via -r deps/requirements_base.txt
+
+
 yarl==1.24.5 \
     --hash=sha256:0055afc45e864b92729ac7600e2d102c17bef060647e74bca75fa84d66b9ff36 \
     --hash=sha256:0465ec8cedc2349b97a6b595ace64084a50c6e839eca40aa0626f38b8350e331 \

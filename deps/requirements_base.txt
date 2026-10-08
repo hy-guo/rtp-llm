@@ -57,4 +57,5 @@ xfastertransformer_devel==1.8.1.1 ; platform_machine == "x86_64"
 xfastertransformer_devel_icx==1.8.1.1 ; platform_machine == "x86_64"
 zstandard==0.25.0
 pybind11_stubgen
-xgrammar==0.2.5
+xgrammar @ https://github.com/hy-guo/rtp-llm/releases/download/qwen4-exp-deps-20261008/xgrammar-0.2.3%2Brtp.60fc70ee-cp310-cp310-linux_x86_64.whl#sha256=031302746481bc38b8bdab3194bb0914c5cdcc1a41d43d2fbad7346ac382a7b9 ; python_version == "3.10" and sys_platform == "linux" and platform_machine == "x86_64"
+xgrammar @ https://github.com/hy-guo/rtp-llm/releases/download/qwen4-exp-deps-20261008/xgrammar-0.2.3%2Brtp.60fc70ee.tar.gz#sha256=c630a8fa70d1d1f30a31ccbdd4c0a14b3540c45d0a314c49cbb8678df88ae33d ; python_version != "3.10" or sys_platform != "linux" or platform_machine != "x86_64"

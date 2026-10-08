@@ -3586,13 +3586,11 @@ xfastertransformer-devel==1.8.1.1 ; platform_machine == "x86_64" \
 xfastertransformer-devel-icx==1.8.1.1 ; platform_machine == "x86_64" \
     --hash=sha256:dfd1714815d38dfea89532365fbe36d502f0bb3baf37c0b472c16743a8cbe352
     # via -r internal_source/deps/../../open_source/deps/requirements_base.txt
-xgrammar==0.2.5 \
-    --hash=sha256:4833b7a5c267c64fe17e1bac5410f39c0555f7411d9cdc3d09bd07dee872c569 \
-    --hash=sha256:5c84032e8c67f5e02ea8e920ee0d12fc1fce47a3f6b69e3165b1e2264e9f2f18 \
-    --hash=sha256:69901bd7469127b59e22668a41efc25e9062a591b4596e5a8877fae18bd10832 \
-    --hash=sha256:7038525ffb1f3f2c5cf2dc200332e79f6f2fd836a106e7147d8c6b9c63d787a4 \
-    --hash=sha256:a0e49cfd0d447247c72f10505c7d6b84696296f68dd03ca294fc1d961db4e786
+xgrammar @ https://github.com/hy-guo/rtp-llm/releases/download/qwen4-exp-deps-20261008/xgrammar-0.2.3%2Brtp.60fc70ee-cp310-cp310-linux_x86_64.whl \
+    --hash=sha256:031302746481bc38b8bdab3194bb0914c5cdcc1a41d43d2fbad7346ac382a7b9
     # via -r deps/requirements_base.txt
+
+
 yarl==1.20.1 \
     --hash=sha256:03aa1e041727cb438ca762628109ef1333498b122e4c76dd858d186a37cec845 \
     --hash=sha256:041eaa14f73ff5a8986b4388ac6bb43a77f2ea09bf1913df7a35d4646db69e53 \

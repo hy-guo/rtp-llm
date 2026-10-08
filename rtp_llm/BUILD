@@ -12,6 +12,7 @@ load("@arch_config//:arch_select.bzl", "requirement", "whl_deps", "internal_deps
 load("//bazel:bundle.bzl", "bundle_files", "bundle_tar")
 
 load("@release_version//:defs.bzl", "RELEASE_VERSION")
+load("//3rdparty/xgrammar:versions.bzl", "XGRAMMAR_PYTHON_REQUIREMENTS")
 
 load(
     "@local_config_rocm//rocm:build_defs.bzl",
@@ -697,11 +698,10 @@ whl_reqs = [
     "portalocker",
     "concurrent_log_handler",
     "apache-tvm-ffi",
-    "xgrammar==0.2.5",
     # OTel trace runtime; keep the pinned protobuf compatibility constraint.
     "opentelemetry-sdk==1.44.0",
     "opentelemetry-exporter-otlp-proto-http==1.15.0",
-] + whl_deps() + platform_deps() + xft_dep
+] + whl_deps() + platform_deps() + xft_dep + XGRAMMAR_PYTHON_REQUIREMENTS
 
 py_wheel(
     name = "rtp_llm_frontend_whl",
@@ -743,8 +743,7 @@ whl_reqs_dash_sc_grpc = [
     "grpcio>=1.57.0",
     "jsonschema==4.26.0",
     "protobuf>=4.25",
-    "xgrammar==0.2.5",
-]
+] + XGRAMMAR_PYTHON_REQUIREMENTS
 
 py_wheel(
     name = "rtp_llm_dash_sc_grpc_whl",
