@@ -43,6 +43,15 @@ namespace {
 constexpr int    kLayerId        = 0;
 constexpr size_t kPhysicalBlocks = 8;
 
+void ensureRuntimeInitialized() {
+    static std::once_flag runtime_once;
+    std::call_once(runtime_once, []() {
+        if (!isRuntimeInitialized()) {
+            initRuntime(0, false, false, MlaOpsType::AUTO);
+        }
+    });
+}
+
 struct TestCacheSpec: public KVCacheSpec {
     TestCacheSpec(std::string cache_tag, size_t tokens_per_block, size_t bytes): bytes_(bytes) {
         tag                = std::move(cache_tag);
@@ -444,6 +453,21 @@ Scenario makeMtpScenario() {
 }
 
 Scenario makeScenario(const std::string& name) {
+    if (name == "cuda_lengths_host_prefix" || name == "cuda_lengths_host_prefix_micro") {
+        auto config = makeCacheConfig({{"full", 128, 256}});
+        auto layout = makeLayout(config);
+        auto inputs = makeInputs(
+            {1, 3, 4}, {501, 502, 503}, std::vector<int64_t>(24, 0), 8, std::vector<int32_t>(24, 1), 1, 8, 128, 256);
+        inputs.input_lengths  = inputs.input_lengths.cuda();
+        inputs.prefix_lengths = pinnedTensor({128, 256, 512}, {3});
+        inputs.pd_separation  = false;
+        Scenario scenario{
+            std::move(config), std::move(layout.layout), std::move(layout.base_addresses), std::move(inputs)};
+        if (name == "cuda_lengths_host_prefix_micro") {
+            scenario.device_resources.enable_layer_micro_batch = static_cast<int>(MicroBatchType::DS_PREFILL);
+        }
+        return scenario;
+    }
     if (name == "multi_tag") {
         return makeMultiTagScenario();
     }
@@ -499,13 +523,7 @@ py::dict serializeResult(const RecordingCacheStore& store, const std::map<std::s
 }
 
 py::dict runPyWrappedModelCacheStoreScenario(py::object py_model, const std::string& scenario_name) {
-    static std::once_flag runtime_once;
-    std::call_once(runtime_once, []() {
-        initRuntime(/*device_id=*/0,
-                    /*trace_memory=*/false,
-                    /*enable_comm_overlap=*/false,
-                    MlaOpsType::AUTO);
-    });
+    ensureRuntimeInitialized();
 
     auto scenario    = makeScenario(scenario_name);
     auto cache_store = std::make_shared<RecordingCacheStore>();
@@ -540,7 +558,7 @@ py::dict runPyWrappedModelCacheStoreScenario(py::object py_model, const std::str
                               SpeculativeExecutionConfig{},
                               scenario.device_resources,
                               MlaOpsType::AUTO,
-                              /*max_seq_len=*/64,
+                              /*max_seq_len=*/scenario_name.find("cuda_lengths_host_prefix") == 0 ? 1024 : 64,
                               /*hidden_size=*/1,
                               active_config.seq_size_per_block,
                               active_config.kernel_seq_size_per_block,
@@ -554,6 +572,12 @@ py::dict runPyWrappedModelCacheStoreScenario(py::object py_model, const std::str
                 model, std::make_unique<TestContextParallelProcessor>(scenario.parallelism));
         }
         (void)model.forward(scenario.inputs);
+        if (scenario_name.find("cuda_lengths_host_prefix") == 0) {
+            scenario.inputs.prefix_lengths = pinnedTensor({256, 128, 384}, {3});
+            (void)model.forward(scenario.inputs);
+            scenario.inputs.prefix_lengths = pinnedTensor({0, 0, 0}, {3});
+            (void)model.forward(scenario.inputs);
+        }
     }
     return serializeResult(*cache_store, scenario.base_addresses);
 }

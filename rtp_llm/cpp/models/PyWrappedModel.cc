@@ -364,6 +364,13 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
         py_attn_inputs.cu_kv_seqlens_device    = torch::empty({batch_size + 1}, cuda_i32);
         py_attn_inputs.padding_offset          = torch::empty({py_attn_inputs.total_tokens}, cuda_i32);
 #if USING_CUDA
+        if (!py_attn_inputs.prefix_lengths.is_cuda()) {
+            // A CUDA input length can accompany a host prefix on MTP prefix
+            // hits. Its device mirror is a deferred H2D destination: fill it
+            // on this stream before the metadata kernel reads it.
+            fusedCopy(d2d_copies_);
+            d2d_copies_.clear();
+        }
         invokeBuildAttentionInputMetadata(py_attn_inputs.input_lengths_device,
                                           py_attn_inputs.prefix_lengths_device,
                                           py_attn_inputs.cu_seqlens_device,
@@ -660,8 +667,9 @@ GptModelOutputs PyWrappedModel::forwardMicroBatched(const GptModelInputs& inputs
     RTP_LLM_PROFILE_SCOPE("py_model.forwardMicroBatched");
 
     // Per-launch capacity contract: see fuse_copy_util.h sizing rationale.
-    // d2d_copies_ accumulates across ALL micro-batches before the single
-    // fusedCopy() flush below. Per micro-batch this adds ~6 copies from
+    // d2d_copies_ normally accumulates across micro-batches until the final
+    // flush. Mixed device lengths/host prefixes flush before metadata reads.
+    // Per micro-batch this adds ~6 copies from
     // buildPyAttentionInputs + padding_offset, plus group_count from
     // setupKVCacheForAttentionInputs. With the planMicroBatches cap of 2
     // micro-batches and hybrid group_count of 4 the worst case is ~20.
@@ -720,7 +728,7 @@ GptModelOutputs PyWrappedModel::forwardMicroBatched(const GptModelInputs& inputs
                                               bert_embedding_inputs});
     }
 
-    const bool has_cache_store_work = !inputs.warmup && inputs.pd_separation;
+    const bool                has_cache_store_work = !inputs.warmup && inputs.pd_separation;
     CacheStoreWriteCycleGuard cache_store_write_cycle(
         cache_store_async_writer_, has_cache_store_work, track_cache_store_completion_);
 
@@ -991,7 +999,7 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
                 }
             }
         }
-        const bool has_cache_store_work = !inputs.warmup && inputs.pd_separation;
+        const bool                has_cache_store_work = !inputs.warmup && inputs.pd_separation;
         CacheStoreWriteCycleGuard cache_store_write_cycle(
             cache_store_async_writer_, has_cache_store_work, track_cache_store_completion_);
 
@@ -1438,11 +1446,10 @@ PyWrappedModel::splitInputsIntoMicroBatches(const GptModelInputs& inputs, const 
     size_t                      prefill_batch_idx      = 0;
     // TODO(async): micro-batch token slicing still computes CPU scalar sums.
     // Convert explicitly and keep all sliced GptModelInputs device-resident.
-    const auto input_lengths_host = inputs.input_lengths.defined() && inputs.input_lengths.is_cuda() ?
-                                        inputs.input_lengths.cpu().pin_memory() :
-                                        inputs.input_lengths;
-    const auto* input_lengths_ptr =
-        input_lengths_host.defined() ? input_lengths_host.data_ptr<int32_t>() : nullptr;
+    const auto  input_lengths_host = inputs.input_lengths.defined() && inputs.input_lengths.is_cuda() ?
+                                         inputs.input_lengths.cpu().pin_memory() :
+                                         inputs.input_lengths;
+    const auto* input_lengths_ptr  = input_lengths_host.defined() ? input_lengths_host.data_ptr<int32_t>() : nullptr;
 
     if (!micro_batch_plan.enable) {
         RTP_LLM_LOG_DEBUG("micro batch disable when enable is false, use fake");
