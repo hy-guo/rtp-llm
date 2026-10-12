@@ -31,3 +31,9 @@ py_test(
     ],
     exec_properties = {'gpu':'A10'},
 )
+
+py_test(
+    name = "nvfp4_cache_test",
+    srcs = ["nvfp4_cache_test.py"],
+    deps = ["//rtp_llm:testlib"],
+)
