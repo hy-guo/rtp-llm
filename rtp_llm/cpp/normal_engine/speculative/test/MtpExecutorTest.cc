@@ -111,8 +111,8 @@ TEST(MtpExecutorPolicyTest, HybridCacheWaitsBeforeReadingNextRoundHostState) {
 }
 
 TEST(MtpExecutorPolicyTest, MtpSequenceUpperBoundChainsUntilBookkeepingCatchesUp) {
-    constexpr int width = 8;
-    const int first_next = MtpExecutor::selectMtpPreviousSeqLenUpperBound(
+    constexpr int width      = 8;
+    const int     first_next = MtpExecutor::selectMtpPreviousSeqLenUpperBound(
                                /*pending=*/false, /*previous_next_bound=*/-1, /*host_seq_len=*/96)
                            + width;
     const int second_next = MtpExecutor::selectMtpPreviousSeqLenUpperBound(
@@ -124,10 +124,12 @@ TEST(MtpExecutorPolicyTest, MtpSequenceUpperBoundChainsUntilBookkeepingCatchesUp
     EXPECT_EQ(104, first_next);
     EXPECT_EQ(112, second_next);
     EXPECT_EQ(120, third_next);
-    EXPECT_EQ(96, MtpExecutor::selectMtpPreviousSeqLenUpperBound(
-                      /*pending=*/false, /*previous_next_bound=*/third_next, /*host_seq_len=*/96));
-    EXPECT_EQ(96, MtpExecutor::selectMtpPreviousSeqLenUpperBound(
-                      /*pending=*/true, /*previous_next_bound=*/-1, /*host_seq_len=*/96));
+    EXPECT_EQ(96,
+              MtpExecutor::selectMtpPreviousSeqLenUpperBound(
+                  /*pending=*/false, /*previous_next_bound=*/third_next, /*host_seq_len=*/96));
+    EXPECT_EQ(96,
+              MtpExecutor::selectMtpPreviousSeqLenUpperBound(
+                  /*pending=*/true, /*previous_next_bound=*/-1, /*host_seq_len=*/96));
 }
 
 TEST(MtpExecutorPolicyTest, DSparkPositionStateAdvancesByAcceptedLength) {
@@ -894,6 +896,12 @@ TEST_F(MtpExecutorTest, testSingleBatchPrefill) {
     MtpExecutorTestConfig test_config;
     test_config.gen_num_per_cycle = 4;
     auto components               = createMtpExecutorComponents(test_config);
+    int  profile_starts           = 0;
+    int  profile_finishes         = 0;
+    components.executor->setModelForwardCallbacks([&]() { ++profile_starts; }, [&]() { ++profile_finishes; });
+    ASSERT_TRUE(components.executor->process({}).ok());
+    EXPECT_EQ(profile_starts, 0);
+    EXPECT_EQ(profile_finishes, 0);
 
     size_t batch_size = 1;
 
@@ -960,6 +968,10 @@ TEST_F(MtpExecutorTest, testSingleBatchPrefill) {
     // Verify executor was created successfully
     auto status = components.executor->process({stream1});
     ASSERT_TRUE(status.ok());
+    // PDFUSION runs prefill followed by an idle decode phase here: count one
+    // real work step, with balanced callbacks, rather than both phases.
+    EXPECT_EQ(profile_starts, 1);
+    EXPECT_EQ(profile_finishes, 1);
 
     // check stream result
     checkOutput(stream1, {0, 1, 2, 3, 1}, {1, 2}, {0.0, 0.0, 1.0, 0.0}, {0.27, 0.28});
