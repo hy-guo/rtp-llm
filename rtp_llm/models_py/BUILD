@@ -50,7 +50,7 @@ py_library(
     srcs = glob([
         "modules/*.py",
         "modules/**/*.py",
-    ]),
+    ], exclude = ["modules/qwen4_exp/test/**"]),
     data = [
         ":cutlass_moe_config",
         ":rocm_fp8_ptpc_hipb_solutions",
@@ -153,6 +153,7 @@ py_library(
     srcs = glob([
         "model_desc/*.py",
         "model_desc/cuda_graph/*.py",
+        "model_desc/qwen4_exp_runtime/*.py",
         "speculative/*.py",
     ]),
     deps = [
