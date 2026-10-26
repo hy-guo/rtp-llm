@@ -3,7 +3,37 @@
 #include "rtp_llm/cpp/utils/AssertUtils.h"
 #include "rtp_llm/cpp/utils/Logger.h"
 
+#include <numeric>
+
 namespace rtp_llm {
+
+int KVCacheGroup::estimateSparsePeakFromSlotCosts(std::vector<int> block_costs,
+                                                  int              final_slots,
+                                                  int              new_slot_cost,
+                                                  int              reserve_step,
+                                                  int              retained_tail_blocks,
+                                                  bool             enable_reuse_cache,
+                                                  int              linear_step) {
+    int physical_blocks = std::accumulate(block_costs.begin(), block_costs.end(), 0);
+    int peak_blocks     = physical_blocks;
+    int next_expired    = 0;
+    block_costs.reserve(std::max(final_slots, static_cast<int>(block_costs.size())));
+    while (static_cast<int>(block_costs.size()) < final_slots) {
+        block_costs.push_back(new_slot_cost);
+        physical_blocks += new_slot_cost;
+        peak_blocks = std::max(peak_blocks, physical_blocks);
+
+        const int last_expired = static_cast<int>(block_costs.size()) - retained_tail_blocks - 1 - reserve_step;
+        // Every slot crosses the retained window once. Reuse checkpoints remain
+        // allocated, but do not need to be revisited on every future decode.
+        for (; next_expired <= last_expired; ++next_expired) {
+            if (!enable_reuse_cache || (next_expired + 1) % linear_step != 0) {
+                physical_blocks -= block_costs[static_cast<size_t>(next_expired)];
+            }
+        }
+    }
+    return peak_blocks;
+}
 
 bool KVCacheGroup::init() {
     auto layer_tensors = block_pool_->allLayerCacheBase();

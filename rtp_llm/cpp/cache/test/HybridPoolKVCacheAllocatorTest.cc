@@ -442,6 +442,89 @@ TEST_F(HybridPoolKVCacheAllocatorTest, InitCreatesIndependentBlockPoolPerGroup) 
     EXPECT_EQ(allocator->groupBlockPools()[1]->totalBlocksNum(), 8u - 1u);
 }
 
+TEST_F(HybridPoolKVCacheAllocatorTest, IndependentPoolEstimatesBoundPhysicalDecodeGrowth) {
+    for (bool reuse : {false, true}) {
+        for (int reserve_step : {0, 5}) {
+            for (int cp_size : {1, 2}) {
+                SCOPED_TRACE(::testing::Message()
+                             << "reuse=" << reuse << " reserve=" << reserve_step << " cp_size=" << cp_size);
+                auto config    = makeTinyMultiPoolHybridConfig(64, 64);
+                auto allocator = makeAllocator(config);
+                allocator->setCPSlotMapper(std::make_shared<CPSlotMapper>(0, cp_size, 4));
+                ASSERT_TRUE(allocator->init());
+                auto resource = makeBatchResource(1, config);
+                auto tokens   = makeCompleteTokenIds(1, 7, 4);
+                tokens->setReserveStep(reserve_step);
+                MallocInfo info{resource, tokens};
+                info.reuse_cache                  = reuse;
+                info.enable_device_cache          = false;
+                info.enable_remove_skipped_blocks = false;
+                const auto fresh = allocator->estimateIndependentPoolNeeds(*resource, 7, 7, 17, reserve_step, reuse, 1);
+                ASSERT_EQ(fresh.size(), 2);
+                ASSERT_TRUE(allocator->malloc(info).success);
+                const auto initialized =
+                    allocator->estimateIndependentPoolNeeds(*resource, 7, 7, 17, reserve_step, reuse, 1);
+                const auto before = snapshotPoolCounters(allocator);
+                for (int length = 8; length <= 24; ++length) {
+                    tokens->setSeqLength(length);
+                    // Inspect the allocation watermark before sparse slots are released.
+                    info.enable_remove_skipped_blocks = false;
+                    ASSERT_TRUE(allocator->malloc(info).success);
+                    for (size_t gid = 0; gid < 2; ++gid) {
+                        const auto available = allocator->groupBlockPools()[gid]->availableBlocksNum();
+                        EXPECT_LE(static_cast<int64_t>(fresh[gid].available_blocks - available),
+                                  fresh[gid].peak_need_blocks);
+                        EXPECT_LE(static_cast<int64_t>(before[gid].available_blocks) - static_cast<int64_t>(available),
+                                  initialized[gid].peak_need_blocks);
+                    }
+                    info.enable_remove_skipped_blocks = true;
+                    ASSERT_TRUE(allocator->malloc(info).success);
+                }
+                allocator->free(FreeInfo{resource, tokens});
+            }
+        }
+    }
+}
+
+TEST_F(HybridPoolKVCacheAllocatorTest, IndependentPoolStepEstimatesCoverSpeculativeBurstsBeforeCleanup) {
+    for (bool reuse : {false, true}) {
+        for (int cp_size : {1, 2}) {
+            auto config    = makeTinyMultiPoolHybridConfig(64, 64);
+            auto allocator = makeAllocator(config);
+            allocator->setCPSlotMapper(std::make_shared<CPSlotMapper>(0, cp_size, 4));
+            ASSERT_TRUE(allocator->init());
+            auto resource = makeBatchResource(1, config);
+            auto tokens   = makeCompleteTokenIds(1, 7, 4);
+            tokens->setReserveStep(5);
+            MallocInfo info{resource, tokens};
+            info.reuse_cache         = reuse;
+            info.enable_device_cache = false;
+            ASSERT_TRUE(allocator->malloc(info).success);
+            const auto lifetime = allocator->estimateIndependentPoolNeeds(*resource, 7, 7, 50, 5, reuse, 1);
+            const auto initial  = snapshotPoolCounters(allocator);
+            for (int length = 12; length <= 57; length += 5) {
+                SCOPED_TRACE(::testing::Message() << "reuse=" << reuse << " cp=" << cp_size << " length=" << length);
+                tokens->setSeqLength(length);
+                const auto step =
+                    allocator->estimateIndependentPoolNeeds(*resource, length, 7, 57 - length, 5, reuse, 1);
+                const auto before                 = snapshotPoolCounters(allocator);
+                info.enable_remove_skipped_blocks = false;
+                ASSERT_TRUE(allocator->malloc(info).success);
+                for (size_t gid = 0; gid < 2; ++gid) {
+                    const auto available = allocator->groupBlockPools()[gid]->availableBlocksNum();
+                    EXPECT_LE(static_cast<int64_t>(before[gid].available_blocks) - static_cast<int64_t>(available),
+                              step[gid].initial_need_blocks);
+                    EXPECT_LE(static_cast<int64_t>(initial[gid].available_blocks) - static_cast<int64_t>(available),
+                              lifetime[gid].peak_need_blocks);
+                }
+                info.enable_remove_skipped_blocks = true;
+                ASSERT_TRUE(allocator->malloc(info).success);
+            }
+            allocator->free(FreeInfo{resource, tokens});
+        }
+    }
+}
+
 TEST_F(HybridPoolKVCacheAllocatorTest, SwaDefaultRegionGroupPoolUsesGpuBacking) {
     auto config    = makeTinySwaMultiPoolHybridConfig(/*linear_block_num=*/6, /*swa_block_num=*/8);
     auto allocator = makeAllocator(config);

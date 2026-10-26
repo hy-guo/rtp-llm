@@ -78,6 +78,28 @@ TEST_F(LinearKVCacheGroupTest, DefaultPolicyDrivesBehaviorInterfaces) {
     EXPECT_FALSE(disabled_group.prefixReusable());
 }
 
+TEST_F(LinearKVCacheGroupTest, LongNonReuseLifetimeKeepsBoundedPhysicalPeak) {
+    auto pool = createBlockPool();
+    ASSERT_TRUE(pool->init());
+    LinearKVCacheGroup group({}, makeTestLinearSpec(1), pool, 0, 8);
+    ASSERT_TRUE(group.init());
+    // A large output limit must not require quadratic work or a dense physical pool.
+    EXPECT_EQ(group.estimateInitialBatchPeakNeedBlocks(256, 256, 1 << 20, 0, false, 1), 3);
+    BlockIds blocks;
+    ASSERT_TRUE(group.malloc(blocks, 256, false));
+    const auto free_before = pool->freeBlocksNum();
+    EXPECT_EQ(group.estimatePeakNeedBlocks(256, blocks.blocks(), 1 << 20, 0, false), 2);
+    size_t min_free = free_before;
+    for (int seq_len = 257; seq_len < 512; ++seq_len) {
+        ASSERT_TRUE(group.malloc(blocks, seq_len, false));
+        min_free = std::min(min_free, pool->freeBlocksNum());
+        group.removeSkippedBlocks(blocks, false);
+    }
+    EXPECT_EQ(free_before - min_free, 2u);
+    group.free(blocks.blocks());
+    EXPECT_EQ(pool->freeBlocksNum(), pool->totalBlocksNum());
+}
+
 TEST_F(LinearKVCacheGroupTest, GetNeedBlocksReuseDisabledCountsLastTwoTailAndReserveStep) {
     auto block_pool = createBlockPool();
     ASSERT_TRUE(block_pool->init());

@@ -619,6 +619,78 @@ int64_t HybridPoolKVCacheAllocator::getMrCostTimeMs() const {
     return total;
 }
 
+std::vector<KVCachePoolAdmissionEstimate>
+HybridPoolKVCacheAllocator::estimateIndependentPoolNeeds(const BatchKVCacheResource& resource,
+                                                         int                         seq_len,
+                                                         int                         common_seq_len,
+                                                         int                         remaining_tokens,
+                                                         int                         reserve_step,
+                                                         bool                        enable_reuse_cache,
+                                                         int                         target_batch_size) const {
+    std::vector<KVCachePoolAdmissionEstimate> result;
+    const auto                                total_available = totalReservableAvailableBlocks();
+    const int                                 current_width   = resource.batchSize();
+    const int                                 target_width    = std::max(current_width, target_batch_size);
+    for (size_t gid = 0; gid < kv_cache_groups_.size(); ++gid) {
+        const auto& group           = kv_cache_groups_[gid];
+        const int   group_seq       = cpEffectiveSeqLenForAlloc(gid, seq_len);
+        const int   group_common    = cpEffectiveSeqLenForAlloc(gid, std::clamp(common_seq_len, 0, seq_len));
+        const int   group_remaining = cpEffectiveSeqLenForAlloc(gid, seq_len + remaining_tokens) - group_seq;
+        const auto  estimate        = [&](int steps, int width) -> int64_t {
+            if (resource.curBlocksNum() == 0) {
+                return group->estimateInitialBatchPeakNeedBlocks(
+                    group_seq, group_common, steps, reserve_step, enable_reuse_cache, width);
+            }
+            int64_t need = 0;
+            for (int b = 0; b < current_width; ++b) {
+                need += group->estimatePeakNeedBlocks(
+                    group_seq, resource.blocks(b, gid), steps, reserve_step, enable_reuse_cache);
+            }
+            // Beam expansion can copy sparse recurrent state as well as a partial FULL tail.
+            // Charging a fresh sequence for each new row bounds both without assuming sharing.
+            if (width > current_width) {
+                need += static_cast<int64_t>(width - current_width)
+                        * group->estimateInitialBatchPeakNeedBlocks(
+                            group_seq, group_seq, steps, reserve_step, enable_reuse_cache, 1);
+            }
+            return need;
+        };
+        int64_t initial_need = 0;
+        if (resource.curBlocksNum() != 0) {
+            for (int b = 0; b < current_width; ++b) {
+                initial_need +=
+                    group->estimateNextNeedBlocks(group_seq, resource.blocks(b, gid), reserve_step, enable_reuse_cache);
+            }
+        } else {
+            initial_need = estimate(0, current_width);
+        }
+        int64_t peak_need = group_remaining > 0 || target_width > current_width ?
+                                estimate(group_remaining, target_width) :
+                                initial_need;
+        if (group->hasSparseSlots() && group_remaining > 0) {
+            // Peak simulation advances one slot at a time, but a speculative step allocates its
+            // whole burst before sparse cleanup releases any previous slots.
+            peak_need += static_cast<int64_t>(std::max(reserve_step - 1, 0)) * target_width;
+        }
+        std::unordered_set<BlockIdxType> owned;
+        for (int b = 0; b < current_width; ++b) {
+            for (const auto block : resource.blocks(b, gid)) {
+                if (!isNullBlockIdx(block)) {
+                    owned.insert(block);
+                }
+            }
+        }
+        const auto& pool      = group_block_pools_[gid];
+        const bool  exclusive = pool->requestRefBlocksNum() == owned.size() && pool->connectorRefBlocksNum() == 0;
+        result.push_back({pool->availableBlocksNum(),
+                          reserveBlocksForPool(gid, reserveBlocksNum(), total_available),
+                          initial_need,
+                          std::max(peak_need, initial_need),
+                          exclusive});
+    }
+    return result;
+}
+
 size_t HybridPoolKVCacheAllocator::totalReservableAvailableBlocks() const {
     size_t total = 0;
     for (size_t gid = 0; gid < group_block_pools_.size(); ++gid) {
