@@ -373,6 +373,15 @@ public final class JavaMockEngineCluster {
         private final AtomicLong rpcGenerateStream = new AtomicLong();
         private final AtomicLong rpcFetchResponse = new AtomicLong();
         private final AtomicLong rpcCancel = new AtomicLong();
+        private final AtomicLong priorityCancelAttempts = new AtomicLong();
+        // Serialize absent-fence installation with the final enqueue admission.
+        // Never evict a live fence to make room: capacity exhaustion returns
+        // NOT_FOUND and keeps the master in reconciliation instead.
+        private final Object enqueueAdmissionLock = new Object();
+        private final Set<Long> absentEnqueueFences = new LinkedHashSet<>();
+        private volatile boolean admissionHistoryPruned;
+        private volatile CountDownLatch enqueueAdmissionGate;
+        private volatile CountDownLatch cancelFenceGate;
         // Bounded request lifecycle map keyed by request id (Python _request_lifecycle).
         private final LinkedHashMap<Long, Map<String, Object>> requestLifecycles = new LinkedHashMap<>();
         // Bounded cancelled rid history (Python _cancelled / snapshot "cancelled_rids").
@@ -557,48 +566,72 @@ public final class JavaMockEngineCluster {
             }
 
             Runnable process = () -> {
-                for (EngineRpcService.EnqueueBatchDpSlotPB slot : request.getDpSlotsList()) {
-                    List<MockPerformanceModel.RequestShape> shapes = new ArrayList<>(slot.getRequestsCount());
-                    // Phase 1: register per-request state the completion callback
-                    // depends on (responseQueues/requestStates) BEFORE admission so
-                    // an immediately-admitted batch can never complete against a
-                    // missing response queue.
-                    for (EngineRpcService.EnqueueBatchExternalInputPB input : slot.getRequestsList()) {
-                        long requestId = input.getInput().getRequestId();
-                        shapes.add(performance.shape(input.getInput(), cache));
-                        responseQueues.computeIfAbsent(requestId, k -> new LinkedBlockingQueue<>());
-                        requestStates.put(requestId, "running");
+                if (!awaitAdmissionGate(enqueueAdmissionGate, observer)) {
+                    return;
+                }
+                synchronized (enqueueAdmissionLock) {
+                    if (shuttingDown) {
+                        observer.onError(new IllegalStateException("engine shutting down"));
+                        return;
                     }
-                    // Phase 2: admission. false = prefill waiting-queue cap hit
-                    // (batch-level backpressure, independent of the request-level
-                    // queue_depth_limit fault-injection gate checked at the RPC
-                    // entry above). Roll back phase-1 state so rejected requests
-                    // leave no residue (no pendingRequests/waitingPrefillRequests/
-                    // runningTasks were claimed — the cap check rejects before any
-                    // counter is touched).
-                    if (!schedulePrefillCompletion(shapes, request.getBatchId(), slot.getDpRank())) {
-                        String message = String.format(
-                                "prefill waiting queue full (backpressure): waiting=%d cap=%d",
-                                prefillPendingQueueSize(), performance.maxWaitingPrefillBatches());
+                    for (EngineRpcService.EnqueueBatchDpSlotPB slot : request.getDpSlotsList()) {
+                        List<EngineRpcService.EnqueueBatchExternalInputPB> candidates = new ArrayList<>();
                         for (EngineRpcService.EnqueueBatchExternalInputPB input : slot.getRequestsList()) {
                             long requestId = input.getInput().getRequestId();
-                            responseQueues.remove(requestId);
-                            requestStates.put(requestId, "rejected");
-                            response.addErrorsBuilder()
-                                    .setRequestId(requestId)
-                                    .setErrorInfo(EngineRpcService.ErrorDetailsPB.newBuilder()
-                                            .setErrorMessage(message)
-                                            .build());
+                            if (absentEnqueueFences.contains(requestId)) {
+                                response.addErrorsBuilder().setRequestId(requestId)
+                                        .setErrorInfo(EngineRpcService.ErrorDetailsPB.newBuilder()
+                                                .setErrorCode(8429L)
+                                                .setErrorMessage("request fenced before enqueue").build());
+                            } else {
+                                candidates.add(input);
+                            }
                         }
-                        continue;
-                    }
-                    // Phase 3: success bookkeeping (only admitted requests count).
-                    for (EngineRpcService.EnqueueBatchExternalInputPB input : slot.getRequestsList()) {
-                        stats.enqueuedRequests.increment();
-                        acceptedCount.incrementAndGet();
-                        long requestId = input.getInput().getRequestId();
-                        response.addSuccessesBuilder().setRequestId(requestId);
-                        recordLifecycleStart(requestId, request.getBatchId(), "enqueue_batch");
+                        if (candidates.isEmpty()) {
+                            continue;
+                        }
+                        List<MockPerformanceModel.RequestShape> shapes = new ArrayList<>(slot.getRequestsCount());
+                        // Phase 1: register per-request state the completion callback
+                        // depends on (responseQueues/requestStates) BEFORE admission so
+                        // an immediately-admitted batch can never complete against a
+                        // missing response queue.
+                        for (EngineRpcService.EnqueueBatchExternalInputPB input : candidates) {
+                            long requestId = input.getInput().getRequestId();
+                            shapes.add(performance.shape(input.getInput(), cache));
+                            responseQueues.computeIfAbsent(requestId, k -> new LinkedBlockingQueue<>());
+                            requestStates.put(requestId, "running");
+                        }
+                        // Phase 2: admission. false = prefill waiting-queue cap hit
+                        // (batch-level backpressure, independent of the request-level
+                        // queue_depth_limit fault-injection gate checked at the RPC
+                        // entry above). Roll back phase-1 state so rejected requests
+                        // leave no residue (no pendingRequests/waitingPrefillRequests/
+                        // runningTasks were claimed — the cap check rejects before any
+                        // counter is touched).
+                        if (!schedulePrefillCompletion(shapes, request.getBatchId(), slot.getDpRank())) {
+                            String message = String.format(
+                                    "prefill waiting queue full (backpressure): waiting=%d cap=%d",
+                                    prefillPendingQueueSize(), performance.maxWaitingPrefillBatches());
+                            for (EngineRpcService.EnqueueBatchExternalInputPB input : candidates) {
+                                long requestId = input.getInput().getRequestId();
+                                responseQueues.remove(requestId);
+                                requestStates.put(requestId, "rejected");
+                                response.addErrorsBuilder()
+                                        .setRequestId(requestId)
+                                        .setErrorInfo(EngineRpcService.ErrorDetailsPB.newBuilder()
+                                                .setErrorMessage(message)
+                                                .build());
+                            }
+                            continue;
+                        }
+                        // Phase 3: success bookkeeping (only admitted requests count).
+                        for (EngineRpcService.EnqueueBatchExternalInputPB input : candidates) {
+                            stats.enqueuedRequests.increment();
+                            acceptedCount.incrementAndGet();
+                            long requestId = input.getInput().getRequestId();
+                            response.addSuccessesBuilder().setRequestId(requestId);
+                            recordLifecycleStart(requestId, request.getBatchId(), "enqueue_batch");
+                        }
                     }
                 }
                 observer.onNext(response.build());
@@ -687,37 +720,47 @@ public final class JavaMockEngineCluster {
             }
 
             long requestId = request.getRequestId();
-            MockPerformanceModel.RequestShape shape = performance.shape(request, cache);
-            acceptedCount.incrementAndGet();
-            lastEnqueueTime.set(System.nanoTime());
-            requestStates.put(requestId, "running");
-            recordLifecycleStart(requestId, -1, "generate_stream");
-
-            LinkedBlockingQueue<EngineRpcService.GenerateOutputsPB> queue =
-                    responseQueues.computeIfAbsent(requestId, k -> new LinkedBlockingQueue<>());
-
-            if (roleType == EngineRpcService.RoleTypePB.ROLE_TYPE_DECODE) {
-                if (!scheduleDecodeCompletion(shape, -1, queue)) {
-                    // Backpressure: decode pending queue full — reject so the
-                    // caller (master/client) perceives decode overload and can
-                    // retry elsewhere. Clean up the per-request state set up above.
-                    responseQueues.remove(requestId);
-                    requestStates.put(requestId, "rejected");
-                    observer.onError(new RuntimeException("decode queue full (backpressure)"));
+            LinkedBlockingQueue<EngineRpcService.GenerateOutputsPB> queue;
+            synchronized (enqueueAdmissionLock) {
+                if (shuttingDown) {
+                    observer.onError(new IllegalStateException("engine shutting down"));
                     return;
                 }
-            } else {
-                if (!schedulePrefillCompletion(List.of(shape), -1, 0)) {
-                    // Backpressure: prefill waiting-queue cap hit — reject so the
-                    // caller perceives prefill overload (mirrors the decode
-                    // rejection above). Clean up the per-request state set up
-                    // above; the cap check rejects before claiming any counter.
-                    responseQueues.remove(requestId);
-                    requestStates.put(requestId, "rejected");
-                    observer.onError(new RuntimeException(String.format(
-                            "prefill waiting queue full (backpressure): waiting=%d cap=%d",
-                            prefillPendingQueueSize(), performance.maxWaitingPrefillBatches())));
+                if (absentEnqueueFences.contains(requestId)) {
+                    observer.onError(new IllegalStateException("request fenced before admission"));
                     return;
+                }
+                MockPerformanceModel.RequestShape shape = performance.shape(request, cache);
+                acceptedCount.incrementAndGet();
+                lastEnqueueTime.set(System.nanoTime());
+                requestStates.put(requestId, "running");
+                recordLifecycleStart(requestId, -1, "generate_stream");
+
+                queue = responseQueues.computeIfAbsent(requestId, k -> new LinkedBlockingQueue<>());
+
+                if (roleType == EngineRpcService.RoleTypePB.ROLE_TYPE_DECODE) {
+                    if (!scheduleDecodeCompletion(shape, -1, queue)) {
+                        // Backpressure: decode pending queue full — reject so the
+                        // caller (master/client) perceives decode overload and can
+                        // retry elsewhere. Clean up the per-request state set up above.
+                        responseQueues.remove(requestId);
+                        requestStates.put(requestId, "rejected");
+                        observer.onError(new RuntimeException("decode queue full (backpressure)"));
+                        return;
+                    }
+                } else {
+                    if (!schedulePrefillCompletion(List.of(shape), -1, 0)) {
+                        // Backpressure: prefill waiting-queue cap hit — reject so the
+                        // caller perceives prefill overload (mirrors the decode
+                        // rejection above). Clean up the per-request state set up
+                        // above; the cap check rejects before claiming any counter.
+                        responseQueues.remove(requestId);
+                        requestStates.put(requestId, "rejected");
+                        observer.onError(new RuntimeException(String.format(
+                                "prefill waiting queue full (backpressure): waiting=%d cap=%d",
+                                prefillPendingQueueSize(), performance.maxWaitingPrefillBatches())));
+                        return;
+                    }
                 }
             }
 
@@ -977,6 +1020,86 @@ public final class JavaMockEngineCluster {
                 return new CancelResult(false, null, true);
             }
             return new CancelResult(false, null, false);
+        }
+
+        /**
+         * Priority Cancel adds the strong never-admitted branch to the legacy
+         * administrative cancel above. The mock's stopped fault leaves this
+         * control owner alive; a full shutdown cannot establish a new fence.
+         */
+        EngineRpcService.CancelStatusPB cancelRequestWithAbsentFence(long requestId) {
+            priorityCancelAttempts.incrementAndGet();
+            if (!awaitAdmissionGate(cancelFenceGate, null)) {
+                throw new IllegalStateException("test Cancel gate was not released");
+            }
+            synchronized (enqueueAdmissionLock) {
+                if (shuttingDown) {
+                    return EngineRpcService.CancelStatusPB.CANCEL_STATUS_NOT_FOUND;
+                }
+                CancelResult result = cancelRequest(requestId);
+                if (absentEnqueueFences.contains(requestId)) {
+                    return EngineRpcService.CancelStatusPB.CANCEL_STATUS_TOMBSTONED;
+                }
+                if (result.found()) {
+                    return EngineRpcService.CancelStatusPB.CANCEL_STATUS_ACCEPTED;
+                }
+                // A completion temporarily has no runningTasks entry before
+                // recording its terminal and handing off to Decode. Any known
+                // lifecycle still proves prior admission during that window.
+                synchronized (requestLifecycles) {
+                    if (requestLifecycles.containsKey(requestId) || admissionHistoryPruned) {
+                        return EngineRpcService.CancelStatusPB.CANCEL_STATUS_NOT_FOUND;
+                    }
+                }
+                if (result.alreadyFinished() || requestStates.containsKey(requestId)
+                        || absentEnqueueFences.size() >= CANCELLED_RID_CAP) {
+                    return EngineRpcService.CancelStatusPB.CANCEL_STATUS_NOT_FOUND;
+                }
+                absentEnqueueFences.add(requestId);
+                return EngineRpcService.CancelStatusPB.CANCEL_STATUS_TOMBSTONED;
+            }
+        }
+
+        void setEnqueueAdmissionGate(CountDownLatch gate) {
+            enqueueAdmissionGate = gate;
+        }
+
+        void setCancelFenceGate(CountDownLatch gate) {
+            cancelFenceGate = gate;
+        }
+
+        long getPriorityCancelAttempts() {
+            return priorityCancelAttempts.get();
+        }
+
+        long getEnqueueBatchRpcCount() {
+            return rpcEnqueueBatch.get();
+        }
+
+        boolean isAbsentEnqueueFenced(long requestId) {
+            synchronized (enqueueAdmissionLock) {
+                return absentEnqueueFences.contains(requestId);
+            }
+        }
+
+        private static boolean awaitAdmissionGate(CountDownLatch gate, StreamObserver<?> observer) {
+            if (gate == null) {
+                return true;
+            }
+            try {
+                if (gate.await(5, TimeUnit.SECONDS)) {
+                    return true;
+                }
+                if (observer != null) {
+                    observer.onError(new IllegalStateException("test admission gate was not released"));
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                if (observer != null) {
+                    observer.onError(e);
+                }
+            }
+            return false;
         }
 
         /**
@@ -1684,8 +1807,10 @@ public final class JavaMockEngineCluster {
          * trip checkLeakDrain.
          */
         void drainAndShutdown() {
-            shuttingDown = true;
-            stopped = true; // same rejection semantics as the control-plane /stop_engine
+            synchronized (enqueueAdmissionLock) {
+                shuttingDown = true;
+                stopped = true;
+            }
             // Cancel sweep. A pass can promote queued decode tasks into running
             // slots (cancel's slot hand-off) and a racing cross-engine hand-off
             // may slip in before the shuttingDown guard was observed, so retry
@@ -1729,9 +1854,11 @@ public final class JavaMockEngineCluster {
         }
 
         /**
-         * Shut down the dedicated response-polling executor.
+         * Finish the engine lifetime, including the same admission fence and
+         * resource drain used by process shutdown, then stop response polling.
          */
         void shutdown() {
+            drainAndShutdown();
             responseExecutor.shutdownNow();
         }
 
@@ -1859,6 +1986,7 @@ public final class JavaMockEngineCluster {
                 requestLifecycles.put(requestId, lifecycle);
                 // Bounded like Python _prune_lifecycle: evict the oldest entries once over cap.
                 while (requestLifecycles.size() > LIFECYCLE_CAP) {
+                    admissionHistoryPruned = true;
                     requestLifecycles.remove(requestLifecycles.keySet().iterator().next());
                 }
             }

@@ -1,5 +1,6 @@
 package org.flexlb.mock;
 
+import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
 import org.flexlb.engine.grpc.EngineRpcService;
 import org.flexlb.engine.grpc.RoleTypeProtoConverter;
@@ -8,7 +9,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.List;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -44,6 +49,13 @@ public class MockRpcService extends RpcServiceGrpc.RpcServiceImplBase {
 
     /** Counter for CheckHealth calls. */
     final AtomicLong healthCheckCount = new AtomicLong(0);
+    private final AtomicLong cancelCallCount = new AtomicLong();
+    private final Object admissionLock = new Object();
+    private final Set<Long> admittedRequests = new HashSet<>();
+    private final Set<Long> absentFences = new HashSet<>();
+    private final Set<Long> fencedEnqueueRejections = new HashSet<>();
+    private volatile CountDownLatch enqueueAdmissionGate;
+    private volatile CountDownLatch cancelFenceGate;
 
     // ==================== Behavior (volatile, hot-swappable) ====================
 
@@ -82,6 +94,53 @@ public class MockRpcService extends RpcServiceGrpc.RpcServiceImplBase {
         return healthCheckCount.get();
     }
 
+    public long getCancelCallCount() {
+        return cancelCallCount.get();
+    }
+
+    public boolean isAdmitted(long requestId) {
+        synchronized (admissionLock) {
+            return admittedRequests.contains(requestId);
+        }
+    }
+
+    public boolean isAbsentFenced(long requestId) {
+        synchronized (admissionLock) {
+            return absentFences.contains(requestId);
+        }
+    }
+
+    public boolean wasFencedEnqueueRejected(long requestId) {
+        synchronized (admissionLock) {
+            return fencedEnqueueRejections.contains(requestId);
+        }
+    }
+
+    public void setEnqueueAdmissionGate(CountDownLatch gate) {
+        enqueueAdmissionGate = gate;
+    }
+
+    public void setCancelFenceGate(CountDownLatch gate) {
+        cancelFenceGate = gate;
+    }
+
+    private static boolean awaitGate(CountDownLatch gate, StreamObserver<?> observer) {
+        if (gate == null) {
+            return true;
+        }
+        try {
+            if (gate.await(5, TimeUnit.SECONDS)) {
+                return true;
+            }
+            observer.onError(Status.DEADLINE_EXCEEDED
+                    .withDescription("test admission gate was not released").asRuntimeException());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            observer.onError(Status.CANCELLED.withCause(e).asRuntimeException());
+        }
+        return false;
+    }
+
     /** Clear all call records (useful between test cases sharing a worker). */
     public void resetRecords() {
         enqueuedRequests.clear();
@@ -100,6 +159,10 @@ public class MockRpcService extends RpcServiceGrpc.RpcServiceImplBase {
         log.debug("MockRpcService enqueueBatch: batch_id={}, dp_slots={}, delay_ms={}, fail={}",
                 request.getBatchId(), request.getDpSlotsCount(), beh.getEnqueueDelayMs(), beh.isFailOnEnqueue());
 
+        if (!awaitGate(enqueueAdmissionGate, responseObserver)) {
+            return;
+        }
+
         if (beh.getEnqueueDelayMs() > 0) {
             try {
                 Thread.sleep(beh.getEnqueueDelayMs());
@@ -112,32 +175,62 @@ public class MockRpcService extends RpcServiceGrpc.RpcServiceImplBase {
                 EngineRpcService.EnqueueBatchResponsePB.newBuilder()
                         .setBatchId(request.getBatchId());
 
-        if (beh.isFailOnEnqueue()) {
+        synchronized (admissionLock) {
             for (EngineRpcService.EnqueueBatchDpSlotPB slot : request.getDpSlotsList()) {
                 for (EngineRpcService.EnqueueBatchExternalInputPB ext : slot.getRequestsList()) {
                     long reqId = ext.getInput().getRequestId();
-                    responseBuilder.addErrors(EngineRpcService.EnqueueBatchErrorPB.newBuilder()
-                            .setRequestId(reqId)
-                            .setErrorInfo(EngineRpcService.ErrorDetailsPB.newBuilder()
-                                    .setErrorCode(beh.getEnqueueErrorCode())
-                                    .setErrorMessage(beh.getEnqueueErrorMessage())
-                                    .build())
-                            .build());
-                }
-            }
-        } else {
-            for (EngineRpcService.EnqueueBatchDpSlotPB slot : request.getDpSlotsList()) {
-                for (EngineRpcService.EnqueueBatchExternalInputPB ext : slot.getRequestsList()) {
-                    long reqId = ext.getInput().getRequestId();
-                    responseBuilder.addSuccesses(EngineRpcService.EnqueueBatchSuccessPB.newBuilder()
-                            .setRequestId(reqId)
-                            .build());
+                    if (absentFences.contains(reqId) || beh.isFailOnEnqueue()) {
+                        boolean fenced = absentFences.contains(reqId);
+                        if (fenced) {
+                            fencedEnqueueRejections.add(reqId);
+                        }
+                        responseBuilder.addErrors(EngineRpcService.EnqueueBatchErrorPB.newBuilder()
+                                .setRequestId(reqId)
+                                .setErrorInfo(EngineRpcService.ErrorDetailsPB.newBuilder()
+                                        .setErrorCode(fenced ? 8429L : beh.getEnqueueErrorCode())
+                                        .setErrorMessage(fenced ? "request fenced before enqueue"
+                                                : beh.getEnqueueErrorMessage())
+                                        .build())
+                                .build());
+                    } else {
+                        admittedRequests.add(reqId);
+                        responseBuilder.addSuccesses(EngineRpcService.EnqueueBatchSuccessPB.newBuilder()
+                                .setRequestId(reqId)
+                                .build());
+                    }
                 }
             }
         }
 
         responseObserver.onNext(responseBuilder.build());
         responseObserver.onCompleted();
+    }
+
+    @Override
+    public void cancel(EngineRpcService.CancelRequestPB request,
+                       StreamObserver<EngineRpcService.CancelResponsePB> observer) {
+        cancelCallCount.incrementAndGet();
+        if (behavior.getRoleType() != EngineRpcService.RoleTypePB.ROLE_TYPE_PREFILL) {
+            observer.onError(Status.UNIMPLEMENTED.withDescription("Cancel belongs to Prefill")
+                    .asRuntimeException());
+            return;
+        }
+        if (!awaitGate(cancelFenceGate, observer)) {
+            return;
+        }
+        EngineRpcService.CancelStatusPB result;
+        synchronized (admissionLock) {
+            if (admittedRequests.contains(request.getRequestId())) {
+                // This small RPC fixture has no execution/typed-terminal model.
+                // A previously admitted request must never be called absent.
+                result = EngineRpcService.CancelStatusPB.CANCEL_STATUS_NOT_FOUND;
+            } else {
+                absentFences.add(request.getRequestId());
+                result = EngineRpcService.CancelStatusPB.CANCEL_STATUS_TOMBSTONED;
+            }
+        }
+        observer.onNext(EngineRpcService.CancelResponsePB.newBuilder().setStatus(result).build());
+        observer.onCompleted();
     }
 
     @Override

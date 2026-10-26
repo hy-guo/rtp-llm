@@ -1,52 +1,29 @@
 package org.flexlb.mock.grpc;
 
+import io.grpc.ConnectivityState;
+import io.grpc.ManagedChannel;
+import org.flexlb.balance.scheduler.RequestLifecycleState;
 import org.flexlb.config.FlexlbConfig;
 import org.flexlb.dao.loadbalance.Response;
 import org.flexlb.dao.loadbalance.StrategyErrorType;
+import org.flexlb.engine.grpc.AbstractGrpcClient;
 import org.flexlb.mock.FlexLBMockTestBase;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
+import java.lang.reflect.Field;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/**
- * Worker offline: stop the mock prefill worker's gRPC server while requests
- * are in-flight, verifying that the master detects the connection failure and
- * cleans up resources.
- *
- * <p>Flow:
- * 1. Start mock prefill worker (normal config)
- * 2. Submit request → ACK succeeds (proves the gRPC link works)
- * 4. Stop the mock prefill worker's gRPC server (simulates worker crash)
- * 5. Submit a new request → gRPC call fails (connection refused / channel broken)
- * 6. Verify: request fails with BATCH_DISPATCH_FAILED, inflight cleaned up,
- *    error message contains gRPC failure indication
- *
- * <p>Key mechanism:
- * <ul>
- *   <li>After {@code server.shutdown()}, the TCP port is no longer listening</li>
- *   <li>The gRPC client channel may still be "open" from the client's perspective,
- *       but the next call will fail because:</li>
- *   <li>The server sends a GOAWAY frame during graceful shutdown, and/or</li>
- *   <li>The TCP connection attempt fails with "Connection refused" (20ms timeout)</li>
- *   <li>{@link org.flexlb.engine.grpc.EngineGrpcClient#executeGrpcCall} catches the
- *       {@code StatusRuntimeException}. If {@code isConnectionBrokenError} matches,
- *       it retries once with a new channel — which also fails.</li>
- *   <li>Regardless of retry, the exception propagates to
- *       {@link org.flexlb.balance.scheduler.DefaultBatchDispatcher}, which calls
- *       {@code failItems()} → {@code callback.onFailure()} →
- *       {@link org.flexlb.balance.scheduler.FlexlbBatchScheduler#failAck}</li>
- * </ul>
- *
- * <p>Note: {@code MockWorker.stop()} already supports graceful gRPC server shutdown
- * (up to 5 seconds wait). The test calls it explicitly mid-test; the base class
- * {@code @AfterEach} calls it again, which is safe (no-op on an already-terminated server).
- */
+/** Outage keeps ambiguous ownership; the restored control owner must fence it before cleanup. */
 class WorkerOfflineTest extends FlexLBMockTestBase {
 
     @Override
@@ -62,42 +39,85 @@ class WorkerOfflineTest extends FlexLBMockTestBase {
     }
 
     @Test
-    @Timeout(20)
-    void workerOffline_newRequestFailsAndCleansUp() throws Exception {
+    @Timeout(30)
+    void workerOffline_retainsOwnershipUntilRestoredControlOwnerFences() throws Exception {
         // 1. Submit request with normal worker — should succeed
         CompletableFuture<Response> future1 = submitRequest(20001);
         Response ackResponse = future1.get(5, TimeUnit.SECONDS);
         assertTrue(ackResponse.isSuccess(), "First request should succeed while worker is online");
         assertTrue(ackResponse.isEnqueuedByMaster(), "Should be enqueued by master");
+        ManagedChannel enqueueChannel = batchEnqueueChannel();
         int existingBatches = getPrefillEndpoint().getInflightBatchCount();
+        int existingDecodeReservations = getDecodeEndpoint().getInflightCount();
 
         // 2. Stop the mock prefill worker's gRPC server (simulates worker crash)
         mockPrefillWorker.stop();
 
-        // 3. Brief pause to let the gRPC client detect the connection loss
-        //    (GOAWAY processing / keepalive detection is async)
-        Thread.sleep(500);
-
-        // 4. Submit a new request — gRPC call should fail (connection refused)
+        // Connection failure after RPC invocation is ambiguous, even when this
+        // fixture knows that its socket was already closed.
         CompletableFuture<Response> future2 = submitRequest(20002);
+        awaitCondition(() -> cancelAttempts.get() > 0, 8_000,
+                "the failed real RPC must initiate Cancel reconciliation");
+        assertFalse(future2.isDone(), "an unreachable Cancel owner cannot prove absence");
+        assertEquals(existingBatches + 1, getPrefillEndpoint().getInflightBatchCount());
+        assertEquals(existingDecodeReservations + 1, getDecodeEndpoint().getInflightCount());
+        assertFalse(mockPrefillWorker.getRpcService().isAdmitted(20002));
+
+        // Restart the same control owner and the same service state on the same
+        // real gRPC endpoint. A retry now atomically fences the absent request.
+        mockPrefillWorker.start(prefillGrpcPort);
         Response failResponse = future2.get(10, TimeUnit.SECONDS);
 
-        // 6. Verify: request failed with BATCH_DISPATCH_FAILED
         assertFalse(failResponse.isSuccess(),
-                "Request should fail when prefill worker is offline");
-        assertEquals(StrategyErrorType.BATCH_DISPATCH_FAILED.getErrorCode(), failResponse.getCode(),
-                "Request should have BATCH_DISPATCH_FAILED error code");
-
-        // 7. Verify: error message contains gRPC failure indication
-        String errMsg = failResponse.getErrorMessage();
-        assertTrue(errMsg != null && !errMsg.isEmpty(),
-                "Error message should not be empty");
+                "the fenced request must fail instead of being silently retried");
+        assertEquals(StrategyErrorType.BATCH_SLO_EXPIRED.getErrorCode(), failResponse.getCode());
+        assertEquals(RequestLifecycleState.TIMED_OUT, scheduler.getRequestState(20002L, 0).state());
+        assertTrue(failResponse.getErrorMessage().contains("engine fenced late enqueue"));
+        assertTrue(mockPrefillWorker.getRpcService().isAbsentFenced(20002));
+        assertFalse(mockPrefillWorker.getRpcService().isAdmitted(20002));
 
         // 8. Verify: the failed request does not add leaked prefill inflight state.
-        assertEquals(existingBatches, getPrefillEndpoint().getInflightBatchCount());
+        awaitCondition(() -> getPrefillEndpoint().getInflightBatchCount() == existingBatches
+                        && getDecodeEndpoint().getInflightCount() == existingDecodeReservations,
+                1_000, "only the now-fenced request's ledgers must be released");
 
         // 9. Verify: decode worker never received any enqueue request (PD-separated)
         assertEquals(0, mockDecodeWorker.getEnqueueCount(),
                 "Decode worker should not have received any request");
+        // Cancel and EnqueueBatch use independent pooled transports.
+        awaitReady(enqueueChannel, 5_000);
+        assertSame(enqueueChannel, batchEnqueueChannel(),
+                "recovery must use the original EnqueueBatch channel");
+        Response recovered = submitRequest(20003).get(5, TimeUnit.SECONDS);
+        assertTrue(recovered.isSuccess(), () -> "new requests recover on the restored real channel: code="
+                + recovered.getCode() + " error=" + recovered.getErrorMessage()
+                + " channel=" + enqueueChannel.getState(false));
+        assertTrue(mockPrefillWorker.getRpcService().isAdmitted(20003));
+        assertFalse(mockPrefillWorker.getRpcService().isAbsentFenced(20003));
+    }
+
+    private ManagedChannel batchEnqueueChannel() throws ReflectiveOperationException {
+        Field poolField = AbstractGrpcClient.class.getDeclaredField("channelPool");
+        poolField.setAccessible(true);
+        Map<?, ?> pool = (Map<?, ?>) poolField.get(grpcClient);
+        String key = prefillIp + ":" + prefillGrpcPort + ":"
+                + AbstractGrpcClient.ServiceType.BATCH_ENQUEUE.getSuffix();
+        AbstractGrpcClient<?>.Invoker invoker = (AbstractGrpcClient<?>.Invoker) pool.get(key);
+        assertNotNull(invoker, "the first real ACK must establish the EnqueueBatch channel");
+        return invoker.getChannel();
+    }
+
+    private static void awaitReady(ManagedChannel channel, long timeoutMs) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        ConnectivityState state = channel.getState(true);
+        while (state != ConnectivityState.READY) {
+            assertFalse(state == ConnectivityState.SHUTDOWN, "the original EnqueueBatch channel shut down");
+            long remaining = deadline - System.nanoTime();
+            assertTrue(remaining > 0, () -> "EnqueueBatch channel did not reconnect: " + channel.getState(false));
+            CountDownLatch transition = new CountDownLatch(1);
+            channel.notifyWhenStateChanged(state, transition::countDown);
+            transition.await(remaining, TimeUnit.NANOSECONDS);
+            state = channel.getState(true);
+        }
     }
 }

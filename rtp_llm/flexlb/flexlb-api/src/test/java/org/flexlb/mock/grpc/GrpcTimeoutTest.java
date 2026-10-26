@@ -11,40 +11,14 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/**
- * gRPC batchEnqueue timeout: mock prefill worker delays response beyond the
- * configured gRPC deadline, verifying that master correctly handles the
- * timeout (DEADLINE_EXCEEDED) and cleans up inflight resources.
- *
- * <p>Flow:
- * 1. Configure mock prefill with enqueueDelayMs=3000 (3s) and master deadline=500ms
- * 2. Submit request → dispatched → gRPC batchEnqueue times out at 500ms
- * 3. Verify: request transitions to TIMED_OUT, inflight is cleaned up,
- *    mock prefill received EnqueueBatch (but couldn't respond in time)
- * 4. Recover: change behavior to delay=0, submit new request → succeeds
- *
- * <p>Key mechanism:
- * <ul>
- *   <li>gRPC client sets {@code withDeadlineAfter(deadlineMs)} on the blocking stub</li>
- *   <li>When the deadline fires, the blocking call throws {@code StatusRuntimeException}
- *       with status DEADLINE_EXCEEDED</li>
- *   <li>{@link org.flexlb.balance.scheduler.DefaultBatchDispatcher} catches this in its
- *       {@code catch (Throwable)} block and calls {@code onTimeout()}</li>
- *   <li>The scheduler records a TIMED_OUT tombstone and returns BATCH_SLO_EXPIRED</li>
- * </ul>
- *
- * <p>Note: The mock's {@code enqueueBatch} records the request <em>before</em> sleeping,
- * so the test can verify the mock received the call even though the client timed out.
- * The server thread continues sleeping after the client gives up — this is harmless
- * because gRPC Java's default server executor is a cached thread pool that allocates
- * a new thread for each concurrent request.
- */
+/** A real EnqueueBatch deadline retains ownership until a real Cancel RPC fences admission. */
 class GrpcTimeoutTest extends FlexLBMockTestBase {
 
     @Override
@@ -69,36 +43,62 @@ class GrpcTimeoutTest extends FlexLBMockTestBase {
     @Test
     @Timeout(15)
     void grpcTimeout_requestFailsAndRecovers() throws Exception {
-        // 1. Submit request — gRPC deadline fires at 500ms, mock is still sleeping
-        CompletableFuture<Response> future = submitRequest(10001);
-        Response response = future.get(5, TimeUnit.SECONDS);
+        CountDownLatch allowAdmission = new CountDownLatch(1);
+        CountDownLatch allowCancelFence = new CountDownLatch(1);
+        mockPrefillWorker.getRpcService().setEnqueueAdmissionGate(allowAdmission);
+        mockPrefillWorker.getRpcService().setCancelFenceGate(allowCancelFence);
+        try {
+            CompletableFuture<Response> future = submitRequest(10001);
+            awaitCondition(() -> mockPrefillWorker.getRpcService().getCancelCallCount() > 0,
+                    3_000, "the real gRPC deadline must initiate Cancel reconciliation");
+            assertEquals(1, mockPrefillWorker.getEnqueueCount());
+            assertFalse(future.isDone(), "transport timeout alone cannot settle ownership");
+            assertEquals(1, getPrefillEndpoint().getInflightBatchCount());
+            assertEquals(1, getDecodeEndpoint().getInflightCount());
+            assertFalse(mockPrefillWorker.getRpcService().isAdmitted(10001));
 
-        // 2. Verify: request failed with an explicit timeout result
-        assertFalse(response.isSuccess(), "Request should fail when EnqueueBatch times out");
-        assertEquals(StrategyErrorType.BATCH_SLO_EXPIRED.getErrorCode(), response.getCode(),
-                "Request should have BATCH_SLO_EXPIRED error code");
-        assertEquals(RequestLifecycleState.TIMED_OUT,
-                scheduler.getRequestState(10001L, 0).state());
+            allowCancelFence.countDown();
+            Response response = future.get(5, TimeUnit.SECONDS);
 
-        // 3. Verify: mock prefill received the EnqueueBatch call (recorded before sleep)
-        assertTrue(mockPrefillWorker.getEnqueueCount() >= 1,
-                "Prefill worker should have received at least 1 EnqueueBatch call");
+            // 2. Verify: request failed with an explicit timeout result
+            assertFalse(response.isSuccess(), "Request should fail when EnqueueBatch times out");
+            assertEquals(StrategyErrorType.BATCH_SLO_EXPIRED.getErrorCode(), response.getCode(),
+                    "Request should have BATCH_SLO_EXPIRED error code");
+            assertEquals(RequestLifecycleState.TIMED_OUT,
+                    scheduler.getRequestState(10001L, 0).state());
+            assertTrue(response.getErrorMessage().contains("engine fenced late enqueue"));
+            assertTrue(mockPrefillWorker.getRpcService().isAbsentFenced(10001));
 
-        // 4. Verify: timeout handling cleans up PrefillEndpoint inflight state
-        InflightAssertions.assertPrefillInflightEmpty(getPrefillEndpoint());
+            // 3. Verify: mock prefill received the EnqueueBatch call (recorded before sleep)
+            assertTrue(mockPrefillWorker.getEnqueueCount() >= 1,
+                    "Prefill worker should have received at least 1 EnqueueBatch call");
 
-        // 5. Verify: decode worker never received any request (PD-separated)
-        assertEquals(0, mockDecodeWorker.getEnqueueCount(),
-                "Decode worker should not have received any request");
+            // 4. Verify: timeout handling cleans up PrefillEndpoint inflight state
+            InflightAssertions.assertResourcesReleasedWithin(getPrefillEndpoint(), getDecodeEndpoint(), 1_000);
 
-        // 6. Recover: change behavior to normal delay
-        mockPrefillWorker.setBehavior(MockWorkerBehavior.builder().build());
+            // The original handler is still live after its client deadline. It must
+            // enforce the same fence before any late admission or success response.
+            allowAdmission.countDown();
+            awaitCondition(() -> mockPrefillWorker.getRpcService().wasFencedEnqueueRejected(10001),
+                    5_000, "the late EnqueueBatch must be rejected by the engine fence");
+            assertFalse(mockPrefillWorker.getRpcService().isAdmitted(10001));
 
-        // 7. Submit a new request — should succeed on the same gRPC channel
-        //    (deadline exceeded only cancels the specific call, not the channel)
-        CompletableFuture<Response> future2 = submitRequest(10002);
-        Response response2 = future2.get(5, TimeUnit.SECONDS);
-        assertTrue(response2.isSuccess(), "Subsequent request should succeed after recovery");
+            // 5. Verify: decode worker never received any request (PD-separated)
+            assertEquals(0, mockDecodeWorker.getEnqueueCount(),
+                    "Decode worker should not have received any request");
 
+            // 6. Recover: change behavior to normal delay
+            mockPrefillWorker.setBehavior(MockWorkerBehavior.builder().build());
+
+            // 7. Submit a new request — should succeed on the same gRPC channel
+            //    (deadline exceeded only cancels the specific call, not the channel)
+            CompletableFuture<Response> future2 = submitRequest(10002);
+            Response response2 = future2.get(5, TimeUnit.SECONDS);
+            assertTrue(response2.isSuccess(), "Subsequent request should succeed after recovery");
+            assertTrue(mockPrefillWorker.getRpcService().isAdmitted(10002));
+        } finally {
+            allowCancelFence.countDown();
+            allowAdmission.countDown();
+        }
     }
 }

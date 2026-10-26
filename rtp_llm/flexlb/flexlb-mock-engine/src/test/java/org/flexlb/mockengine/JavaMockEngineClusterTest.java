@@ -5,20 +5,27 @@ import io.grpc.stub.StreamObserver;
 import org.flexlb.engine.grpc.EngineRpcService;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -54,45 +61,127 @@ class JavaMockEngineClusterTest {
     }
 
     @Test
+    @Timeout(15)
     void ackIsImmediateWhileQueuedBatchTransitionsFromWaitingToRunningToFinished() throws Exception {
-        JavaMockEngineCluster.FastRpcService service = service(model("180", 1.0));
+        GatedCompletionScheduler completions = new GatedCompletionScheduler();
+        try {
+            JavaMockEngineCluster.FastRpcService service = service(model("180", 1.0), completions);
+            try {
+                EngineRpcService.EnqueueBatchResponsePB firstAck = enqueue(
+                        service, batch(11, slot(0, input(1, 100), input(2, 200))));
+                EngineRpcService.EnqueueBatchResponsePB secondAck = enqueue(
+                        service, batch(12, slot(0, input(3, 300), input(4, 400), input(5, 500))));
 
-        EngineRpcService.EnqueueBatchResponsePB firstAck = enqueue(
-                service, batch(11, slot(0, input(1, 100), input(2, 200))));
-        EngineRpcService.EnqueueBatchResponsePB secondAck = enqueue(
-                service, batch(12, slot(0, input(3, 300), input(4, 400), input(5, 500))));
+                assertEquals(2, firstAck.getSuccessesCount());
+                assertEquals(3, secondAck.getSuccessesCount());
+                assertEquals(0L, service.getCompletedCount(),
+                        "both real ACKs must arrive before either completion is allowed");
+                assertEquals(1, completions.scheduledCount.get(),
+                        "the waiting batch must not schedule execution before the active batch finishes");
 
-        assertEquals(2, firstAck.getSuccessesCount());
-        assertEquals(3, secondAck.getSuccessesCount());
+                EngineRpcService.WorkerStatusPB initial = awaitStatus(service, status -> {
+                    completions.assertHealthy();
+                    return status.getRunningTaskInfoCount() == 5
+                            && status.getRunningQueryLen() == 2
+                            && status.getWaitingQueryLen() == 3;
+                }, 1_000);
+                assertEquals(0, initial.getFinishedTaskListCount());
+                assertEquals(3, initial.getRunningTaskInfoList().stream()
+                        .filter(task -> task.getPhase() == EngineRpcService.TaskPhase.TASK_PHASE_RECEIVED)
+                        .count());
+                assertTrue(initial.getRunningTaskInfoList().stream()
+                        .filter(task -> task.getBatchId() == 12)
+                        .allMatch(task -> task.getPhase() == EngineRpcService.TaskPhase.TASK_PHASE_RECEIVED));
 
-        EngineRpcService.WorkerStatusPB initial = awaitStatus(service,
-                status -> status.getRunningTaskInfoCount() == 5
-                        && status.getRunningQueryLen() == 2
-                        && status.getWaitingQueryLen() == 3,
-                1_000);
-        assertEquals(0, initial.getFinishedTaskListCount());
-        assertEquals(3, initial.getRunningTaskInfoList().stream()
-                .filter(task -> task.getPhase() == EngineRpcService.TaskPhase.TASK_PHASE_RECEIVED)
-                .count());
-        assertTrue(initial.getRunningTaskInfoList().stream()
-                .filter(task -> task.getBatchId() == 12)
-                .allMatch(task -> task.getPhase() == EngineRpcService.TaskPhase.TASK_PHASE_RECEIVED));
+                completions.releaseAndAwait(0);
+                EngineRpcService.WorkerStatusPB secondRunning = awaitStatus(service, status -> {
+                    completions.assertHealthy();
+                    return status.getRunningTaskInfoCount() == 3
+                            && status.getRunningQueryLen() == 3
+                            && status.getWaitingQueryLen() == 0
+                            && status.getFinishedTaskListCount() == 2;
+                }, 2_000);
+                assertEquals(2, completions.scheduledCount.get());
+                assertTrue(secondRunning.getRunningTaskInfoList().stream()
+                        .allMatch(task -> task.getBatchId() == 12));
 
-        EngineRpcService.WorkerStatusPB secondRunning = awaitStatus(service,
-                status -> status.getRunningTaskInfoCount() == 3
-                        && status.getRunningQueryLen() == 3
-                        && status.getWaitingQueryLen() == 0
-                        && status.getFinishedTaskListCount() == 2,
-                2_000);
-        assertTrue(secondRunning.getRunningTaskInfoList().stream()
-                .allMatch(task -> task.getBatchId() == 12));
+                completions.releaseAndAwait(1);
+                EngineRpcService.WorkerStatusPB finished = awaitStatus(service, status -> {
+                    completions.assertHealthy();
+                    return status.getRunningTaskInfoCount() == 0
+                            && status.getFinishedTaskListCount() == 5;
+                }, 2_000);
+                assertTrue(finished.getFinishedTaskListList().stream()
+                        .allMatch(task -> task.getExecutionTimeMs() == 180));
+                assertEquals(5L, service.getAcceptedCount());
+                assertEquals(5L, service.getCompletedCount());
+                assertEquals(0, service.getInflightCount());
+                assertEquals(0, service.getPrefillPendingQueueDepth());
+                assertEquals(0, service.getActivePrefillBatchCount());
+                assertFalse(service.isLeakDetected());
+            } finally {
+                completions.releaseAll();
+                service.shutdown();
+            }
+        } finally {
+            completions.releaseAll();
+            completions.shutdownNow();
+            assertTrue(completions.awaitTermination(2, TimeUnit.SECONDS),
+                    "gated completion threads must terminate");
+        }
+    }
 
-        EngineRpcService.WorkerStatusPB finished = awaitStatus(service,
-                status -> status.getRunningTaskInfoCount() == 0
-                        && status.getFinishedTaskListCount() == 5,
-                2_000);
-        assertTrue(finished.getFinishedTaskListList().stream()
-                .allMatch(task -> task.getExecutionTimeMs() == 180));
+    /** Hold only this case's two real completion callbacks, preserving their original delays. */
+    private static final class GatedCompletionScheduler extends ScheduledThreadPoolExecutor {
+        private final List<CountDownLatch> gates = List.of(new CountDownLatch(1), new CountDownLatch(1));
+        private final List<CompletableFuture<Void>> results =
+                List.of(new CompletableFuture<>(), new CompletableFuture<>());
+        private final AtomicInteger scheduledCount = new AtomicInteger();
+
+        GatedCompletionScheduler() {
+            super(2);
+        }
+
+        @Override
+        public ScheduledFuture<?> schedule(Runnable command, long delay, TimeUnit unit) {
+            int index = scheduledCount.getAndIncrement();
+            if (index >= gates.size()) {
+                throw new IllegalStateException("expected exactly two engine completion callbacks");
+            }
+            return super.schedule(() -> {
+                try {
+                    if (!gates.get(index).await(5, TimeUnit.SECONDS)) {
+                        throw new AssertionError("engine completion gate " + index + " was not released");
+                    }
+                    command.run();
+                    results.get(index).complete(null);
+                } catch (InterruptedException error) {
+                    Thread.currentThread().interrupt();
+                    results.get(index).completeExceptionally(error);
+                    throw new IllegalStateException("interrupted engine completion " + index, error);
+                } catch (RuntimeException | Error error) {
+                    results.get(index).completeExceptionally(error);
+                    throw error;
+                }
+            }, delay, unit);
+        }
+
+        void assertHealthy() {
+            for (CompletableFuture<Void> result : results) {
+                if (result.isCompletedExceptionally()) {
+                    result.join();
+                }
+            }
+        }
+
+        void releaseAndAwait(int index) throws Exception {
+            gates.get(index).countDown();
+            results.get(index).get(2, TimeUnit.SECONDS);
+        }
+
+        void releaseAll() {
+            gates.forEach(CountDownLatch::countDown);
+        }
     }
 
     @Test
@@ -115,13 +204,18 @@ class JavaMockEngineClusterTest {
     }
 
     private JavaMockEngineCluster.FastRpcService service(MockPerformanceModel model) {
+        return service(model, scheduler);
+    }
+
+    private JavaMockEngineCluster.FastRpcService service(MockPerformanceModel model,
+                                                        ScheduledExecutorService completionScheduler) {
         Map<Integer, JavaMockEngineCluster.FastRpcService> services = new ConcurrentHashMap<>();
         JavaMockEngineCluster.FastRpcService service = new JavaMockEngineCluster.FastRpcService(
                 "prefill",
                 EngineRpcService.RoleTypePB.ROLE_TYPE_PREFILL,
                 61_000,
                 services,
-                scheduler,
+                completionScheduler,
                 model,
                 100,
                 new JavaMockEngineCluster.ClusterStats());

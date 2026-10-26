@@ -110,7 +110,7 @@ public abstract class MockWorker {
      * Hot-swap the worker behavior at runtime.
      */
     public void setBehavior(MockWorkerBehavior behavior) {
-        rpcService.setBehavior(behavior);
+        rpcService.setBehavior(behavior.toBuilder().roleType(this.behavior.getRoleType()).build());
     }
 
     // ==================== Convenience accessors for call records ====================

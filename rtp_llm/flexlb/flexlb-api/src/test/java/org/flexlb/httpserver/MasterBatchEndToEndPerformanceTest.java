@@ -117,10 +117,12 @@ class MasterBatchEndToEndPerformanceTest extends FlexLBMockTestBase {
     private ServerScheduleLatencyRecorder latencyRecorder;
     private ActiveRequestCounter activeRequestCounter;
     private ch.qos.logback.classic.Logger flexlbLogger;
+    private ch.qos.logback.classic.Logger pvLogger;
     private ch.qos.logback.classic.Logger mockRpcLogger;
     private ch.qos.logback.classic.Logger nettyLogger;
     private ch.qos.logback.classic.Logger grpcLogger;
     private Level previousFlexlbLogLevel;
+    private Level previousPvLogLevel;
     private Level previousMockRpcLogLevel;
     private Level previousNettyLogLevel;
     private Level previousGrpcLogLevel;
@@ -877,14 +879,17 @@ class MasterBatchEndToEndPerformanceTest extends FlexLBMockTestBase {
 
     private void suppressRequestPathLogs() {
         flexlbLogger = (ch.qos.logback.classic.Logger) LoggerFactory.getLogger("flexlbLogger");
+        pvLogger = (ch.qos.logback.classic.Logger) LoggerFactory.getLogger("pvLogger");
         mockRpcLogger = (ch.qos.logback.classic.Logger) LoggerFactory.getLogger("org.flexlb.mock.MockRpcService");
         nettyLogger = (ch.qos.logback.classic.Logger) LoggerFactory.getLogger("io.netty");
         grpcLogger = (ch.qos.logback.classic.Logger) LoggerFactory.getLogger("io.grpc");
         previousFlexlbLogLevel = flexlbLogger.getLevel();
+        previousPvLogLevel = pvLogger.getLevel();
         previousMockRpcLogLevel = mockRpcLogger.getLevel();
         previousNettyLogLevel = nettyLogger.getLevel();
         previousGrpcLogLevel = grpcLogger.getLevel();
         flexlbLogger.setLevel(Level.WARN);
+        pvLogger.setLevel(Level.WARN);
         mockRpcLogger.setLevel(Level.WARN);
         nettyLogger.setLevel(Level.WARN);
         grpcLogger.setLevel(Level.WARN);
@@ -893,6 +898,9 @@ class MasterBatchEndToEndPerformanceTest extends FlexLBMockTestBase {
     private void restoreRequestPathLogs() {
         if (flexlbLogger != null) {
             flexlbLogger.setLevel(previousFlexlbLogLevel);
+        }
+        if (pvLogger != null) {
+            pvLogger.setLevel(previousPvLogLevel);
         }
         if (mockRpcLogger != null) {
             mockRpcLogger.setLevel(previousMockRpcLogLevel);

@@ -6,6 +6,7 @@ import org.flexlb.engine.grpc.EngineRpcService;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.lang.reflect.Method;
@@ -14,12 +15,14 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -44,6 +47,7 @@ import static org.junit.jupiter.api.Assertions.fail;
  *       8429 accepted-eviction path consumes).</li>
  * </ol>
  */
+@Timeout(20)
 class KvAllocatedReportOptInTest {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -52,28 +56,31 @@ class KvAllocatedReportOptInTest {
     @TempDir
     Path tempDir;
 
-    private ScheduledExecutorService scheduler;
+    private GatedCompletionScheduler scheduler;
     private Map<Integer, JavaMockEngineCluster.FastRpcService> services;
     private int nextPortOffset;
 
     @BeforeEach
     void setUp() {
-        scheduler = Executors.newScheduledThreadPool(4, runnable -> {
-            Thread thread = new Thread(runnable, "kv-allocated-optin-scheduler");
-            thread.setDaemon(true);
-            return thread;
-        });
+        scheduler = new GatedCompletionScheduler();
         services = new ConcurrentHashMap<>();
         nextPortOffset = 0;
     }
 
     @AfterEach
     void tearDown() throws InterruptedException {
-        for (JavaMockEngineCluster.FastRpcService service : services.values()) {
-            service.shutdown();
+        scheduler.releaseAll();
+        try {
+            for (JavaMockEngineCluster.FastRpcService service : services.values()) {
+                service.shutdown();
+            }
+            scheduler.shutdown();
+            assertTrue(scheduler.awaitTermination(3, TimeUnit.SECONDS),
+                    "gated decode completion threads must terminate");
+            scheduler.assertHealthy();
+        } finally {
+            scheduler.shutdownNow();
         }
-        scheduler.shutdownNow();
-        scheduler.awaitTermination(3, TimeUnit.SECONDS);
     }
 
     // ──────────── State 1: flag absent → today's reporting, zero change ────────────
@@ -103,6 +110,17 @@ class KvAllocatedReportOptInTest {
         // until run start, exactly today's behavior.
         assertEquals(8, decode.getActiveKvTokens(),
                 "default OFF: only the running request's input tokens are counted");
+        assertEquals(0, decode.getCompletedCount());
+        assertEquals(1, scheduler.scheduledCount.get(), "queued requests must not schedule completion yet");
+
+        scheduler.releaseAndAwait(0);
+        EngineRpcService.WorkerStatusPB secondRunning = workerStatus(decode, 0);
+        assertEquals(1, secondRunning.getWaitingQueryLen());
+        assertEquals(2, secondRunning.getRunningTaskInfoCount());
+        assertEquals(8, decode.getActiveKvTokens(), "default OFF: a drained request takes the released KV");
+        scheduler.releaseAndAwait(1);
+        assertEquals(8, decode.getActiveKvTokens());
+        scheduler.releaseAndAwait(2);
 
         awaitQuiescence(decode, 30_000);
         assertEquals(3, decode.getCompletedCount());
@@ -136,9 +154,25 @@ class KvAllocatedReportOptInTest {
         // three requests (1 running + 2 queued) are counted.
         assertEquals(24, decode.getActiveKvTokens(),
                 "opt-in: queued requests must hold their KV reservation from enqueue");
+        assertEquals(0, decode.getCompletedCount());
+        assertEquals(1, scheduler.scheduledCount.get(), "only the running request may schedule completion");
 
         // As slots free, queued requests drain and their phase flips to
         // RUNNING; eventually everything completes with no leak.
+        scheduler.releaseAndAwait(0);
+        EngineRpcService.WorkerStatusPB secondRunning = workerStatus(decode, 0);
+        assertEquals(1, secondRunning.getRunningQueryLen());
+        assertEquals(1, secondRunning.getWaitingQueryLen());
+        assertEquals(EngineRpcService.TaskPhase.TASK_PHASE_RUNNING, phaseOf(secondRunning, 2L));
+        assertEquals(EngineRpcService.TaskPhase.TASK_PHASE_KV_ALLOCATED, phaseOf(secondRunning, 3L));
+        assertEquals(16, decode.getActiveKvTokens(), "draining must not double-count the queued KV reservation");
+        scheduler.releaseAndAwait(1);
+        EngineRpcService.WorkerStatusPB thirdRunning = workerStatus(decode, 0);
+        assertEquals(1, thirdRunning.getRunningQueryLen());
+        assertEquals(0, thirdRunning.getWaitingQueryLen());
+        assertEquals(EngineRpcService.TaskPhase.TASK_PHASE_RUNNING, phaseOf(thirdRunning, 3L));
+        assertEquals(8, decode.getActiveKvTokens());
+        scheduler.releaseAndAwait(2);
         awaitQuiescence(decode, 30_000);
         assertEquals(3, decode.getCompletedCount(),
                 "queued requests must still drain and complete normally");
@@ -158,6 +192,12 @@ class KvAllocatedReportOptInTest {
         assertTrue(invokeScheduleDecodeCompletion(decode, shapeOf(model, 2L, 8), -1, null));
         assertEquals(16, decode.getActiveKvTokens(),
                 "opt-in: running + queued requests both hold KV before the cancel");
+        assertEquals(0, decode.getCompletedCount());
+        assertEquals(1, scheduler.scheduledCount.get());
+        EngineRpcService.WorkerStatusPB beforeCancel = workerStatus(decode, 0);
+        assertEquals(1, beforeCancel.getRunningQueryLen());
+        assertEquals(1, beforeCancel.getWaitingQueryLen());
+        assertEquals(EngineRpcService.TaskPhase.TASK_PHASE_KV_ALLOCATED, phaseOf(beforeCancel, 2L));
 
         // Cancel the QUEUED request (rid=2) through Decode's ordinary internal
         // stream-cancellation path. Priority Cancel RPC itself is Prefill-only.
@@ -178,8 +218,10 @@ class KvAllocatedReportOptInTest {
         assertTrue(cancelledReported,
                 "CANCELLED completion for request 2 must appear in WorkerStatus");
 
+        scheduler.releaseAndAwait(0);
         awaitQuiescence(decode, 30_000);
         assertEquals(1, decode.getCompletedCount(), "only the running request completes");
+        assertEquals(1, scheduler.scheduledCount.get(), "the cancelled queued request must never run");
         assertEquals(0, decode.getActiveKvTokens(), "KV must net to zero after quiescence");
         decode.checkLeakDrain(0L);
         assertFalse(decode.isLeakDetected());
@@ -192,6 +234,71 @@ class KvAllocatedReportOptInTest {
         return (int) status.getRunningTaskInfoList().stream()
                 .filter(task -> task.getPhase() == phase)
                 .count();
+    }
+
+    private static EngineRpcService.TaskPhase phaseOf(EngineRpcService.WorkerStatusPB status, long requestId) {
+        return status.getRunningTaskInfoList().stream()
+                .filter(task -> task.getRequestId() == requestId)
+                .findFirst().orElseThrow(() -> new AssertionError("request is not tracked: " + requestId))
+                .getPhase();
+    }
+
+    /** Gate the real decode completion callbacks after their original modelled delay. */
+    private static final class GatedCompletionScheduler extends ScheduledThreadPoolExecutor {
+        private final List<CountDownLatch> gates =
+                List.of(new CountDownLatch(1), new CountDownLatch(1), new CountDownLatch(1));
+        private final List<CompletableFuture<Void>> results =
+                List.of(new CompletableFuture<>(), new CompletableFuture<>(), new CompletableFuture<>());
+        private final AtomicInteger scheduledCount = new AtomicInteger();
+
+        GatedCompletionScheduler() {
+            super(2, runnable -> {
+                Thread thread = new Thread(runnable, "kv-allocated-optin-scheduler");
+                thread.setDaemon(true);
+                return thread;
+            });
+        }
+
+        @Override
+        public ScheduledFuture<?> schedule(Runnable command, long delay, TimeUnit unit) {
+            int index = scheduledCount.getAndIncrement();
+            if (index >= gates.size()) {
+                throw new IllegalStateException("expected at most three decode completion callbacks");
+            }
+            return super.schedule(() -> {
+                try {
+                    if (!gates.get(index).await(5, TimeUnit.SECONDS)) {
+                        throw new AssertionError("decode completion gate " + index + " was not released");
+                    }
+                    command.run();
+                    results.get(index).complete(null);
+                } catch (InterruptedException error) {
+                    Thread.currentThread().interrupt();
+                    results.get(index).completeExceptionally(error);
+                    throw new IllegalStateException("interrupted decode completion " + index, error);
+                } catch (RuntimeException | Error error) {
+                    results.get(index).completeExceptionally(error);
+                    throw error;
+                }
+            }, delay, unit);
+        }
+
+        void assertHealthy() {
+            for (CompletableFuture<Void> result : results) {
+                if (result.isCompletedExceptionally()) {
+                    result.join();
+                }
+            }
+        }
+
+        void releaseAndAwait(int index) throws Exception {
+            gates.get(index).countDown();
+            results.get(index).get(3, TimeUnit.SECONDS);
+        }
+
+        void releaseAll() {
+            gates.forEach(CountDownLatch::countDown);
+        }
     }
 
     private JavaMockEngineCluster.FastRpcService newDecodeService(
@@ -249,6 +356,7 @@ class KvAllocatedReportOptInTest {
             throws Exception {
         long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
         while (System.nanoTime() < deadline) {
+            scheduler.assertHealthy();
             if (service.getInflightCount() == 0 && service.getRunningCount() == 0) {
                 return;
             }

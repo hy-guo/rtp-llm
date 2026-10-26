@@ -19,6 +19,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -29,19 +30,20 @@ import java.util.function.Consumer;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * {@link MockEngineCancelChannel} contract tests against the in-process mock
- * engine cluster (test wiring only — production Spring contexts keep
- * UnsupportedEngineCancelChannel):
+ * engine cluster (production uses GrpcEngineCancelChannel):
  * <ul>
  *   <li>accepted: a live request on the addressed worker is cancelled and its
  *       CANCELLED completion surfaces in WorkerStatus;</li>
  *   <li>idempotent: an accepted priority-cancel tombstone stays ACCEPTED;</li>
- *   <li>not found: completed-before-cancel and unknown requests do not scan
- *       another Prefill for a match;</li>
+ *   <li>not found: completed-before-cancel does not install an absent fence;</li>
+ *   <li>tombstoned: unknown requests are fenced against late enqueue on the
+ *       specifically addressed Prefill;</li>
  *   <li>failed: Decode rejects the Prefill-owned Cancel RPC;</li>
  *   <li>unsupported: endpoint whose port maps to no mock engine.</li>
  * </ul>
@@ -204,17 +206,160 @@ class MockEngineCancelChannelTest {
         awaitAllInflightZero(10_000);
     }
 
-    // ---- not found: unknown request id / wrong worker ----
+    // ---- absent fence: cancel wins before enqueue admission ----
 
     @Test
-    void cancelUnknownRequestIsNotFound() throws Exception {
+    void cancelUnknownRequestFencesLateEnqueueAndIsIdempotent() throws Exception {
         startCluster(model("10"), 1, 1);
+        JavaMockEngineCluster.FastRpcService prefill = prefillServices.get(0);
         EngineCancelChannel channel = new MockEngineCancelChannel(services);
 
         CancelOutcome outcome = channel
-                .cancel(target(prefillServices.get(0).getGrpcPort()), 424242L, 2_000)
+                .cancel(target(prefill.getGrpcPort()), 424242L, 2_000)
+                .get(2, TimeUnit.SECONDS);
+        assertEquals(CancelAck.TOMBSTONED, outcome.ack());
+        assertEquals(CancelAck.TOMBSTONED, channel.cancel(target(prefill.getGrpcPort()), 424242L, 2_000)
+                .get(2, TimeUnit.SECONDS).ack());
+
+        EngineRpcService.EnqueueBatchResponsePB late = enqueue(prefill, batch(9400, slot(0,
+                inputWithDecode(424242L, 10, decodeServices.get(0).getGrpcPort()))));
+        assertEquals(0, late.getSuccessesCount());
+        assertEquals(1, late.getErrorsCount());
+        assertEquals(8429L, late.getErrors(0).getErrorInfo().getErrorCode());
+        assertEquals(0L, prefill.getAcceptedCount());
+        assertEquals(0, prefill.getInflightCount());
+        assertEquals(0, decodeServices.get(0).getInflightCount());
+        assertFalse(prefill.getRequestStates().containsKey(424242L));
+    }
+
+    @Test
+    void cancelDuringDelayedEnqueueFencesBeforeAdmission() throws Exception {
+        startCluster(model("500"), 1, 1);
+        JavaMockEngineCluster.FastRpcService prefill = prefillServices.get(0);
+        EngineCancelChannel channel = new MockEngineCancelChannel(services);
+        CountDownLatch allowAdmission = new CountDownLatch(1);
+        prefill.setEnqueueAdmissionGate(allowAdmission);
+        CompletableFuture<EngineRpcService.EnqueueBatchResponsePB> enqueue =
+                CompletableFuture.supplyAsync(() -> enqueue(prefill, batch(9401, slot(0,
+                        inputWithDecode(424243L, 10, decodeServices.get(0).getGrpcPort())))));
+        try {
+            AutoTpmE2EHarness.await(() -> prefill.getEnqueueBatchRpcCount() == 1,
+                    1_000, "the real enqueue handler must enter before cancellation");
+            CancelOutcome outcome = channel.cancel(target(prefill.getGrpcPort()), 424243L, 2_000)
+                    .get(2, TimeUnit.SECONDS);
+            assertEquals(CancelAck.TOMBSTONED, outcome.ack());
+            assertTrue(prefill.isAbsentEnqueueFenced(424243L));
+            assertFalse(enqueue.isDone(), "the actual admission handler is still gated");
+            allowAdmission.countDown();
+            EngineRpcService.EnqueueBatchResponsePB response = enqueue.get(2, TimeUnit.SECONDS);
+            assertEquals(0, response.getSuccessesCount());
+            assertEquals(1, response.getErrorsCount());
+            assertEquals(8429L, response.getErrors(0).getErrorInfo().getErrorCode());
+            assertEquals(0L, prefill.getAcceptedCount());
+            assertEquals(0, prefill.getInflightCount());
+            assertFalse(prefill.getRequestStates().containsKey(424243L));
+        } finally {
+            allowAdmission.countDown();
+        }
+    }
+
+    @Test
+    void shuttingDownControlOwnerCannotForgeAnAbsentFence() throws Exception {
+        startCluster(model("10"), 1, 1);
+        JavaMockEngineCluster.FastRpcService prefill = prefillServices.get(0);
+        EngineCancelChannel channel = new MockEngineCancelChannel(services);
+        prefill.shutdown();
+        assertTrue(prefill.isShuttingDown());
+
+        CancelOutcome outcome = channel.cancel(target(prefill.getGrpcPort()), 424244L, 2_000)
                 .get(2, TimeUnit.SECONDS);
         assertEquals(CancelAck.NOT_FOUND, outcome.ack());
+        assertFalse(prefill.isAbsentEnqueueFenced(424244L));
+        prefill.setStopped(false);
+        AssertionError rejected = assertThrows(AssertionError.class, () -> enqueue(prefill,
+                batch(9402, slot(0, inputWithDecode(424244L, 10, decodeServices.get(0).getGrpcPort())))));
+        assertTrue(rejected.getMessage().contains("engine shutting down"));
+        assertEquals(0L, prefill.getAcceptedCount());
+        assertEquals(0, prefill.getInflightCount());
+    }
+
+    @Test
+    void fullAbsentFenceCapacityRejectsNewFenceWithoutEvictingOldFence() throws Exception {
+        startCluster(model("10"), 1, 1);
+        JavaMockEngineCluster.FastRpcService prefill = prefillServices.get(0);
+        EngineCancelChannel channel = new MockEngineCancelChannel(services);
+        int capacity = engineHistoryCapacity("CANCELLED_RID_CAP");
+        long firstId = 500_000L;
+        // Exercise the actual engine fence installer while filling the store;
+        // the overflow and retry still cross the real channel implementation.
+        for (int i = 0; i < capacity; i++) {
+            assertEquals(EngineRpcService.CancelStatusPB.CANCEL_STATUS_TOMBSTONED,
+                    prefill.cancelRequestWithAbsentFence(firstId + i));
+        }
+
+        long overflowId = firstId + capacity;
+        CancelOutcome overflow = channel.cancel(target(prefill.getGrpcPort()), overflowId, 2_000)
+                .get(2, TimeUnit.SECONDS);
+        assertEquals(CancelAck.NOT_FOUND, overflow.ack(),
+                "capacity exhaustion cannot claim that a new absent fence was installed");
+        assertFalse(prefill.isAbsentEnqueueFenced(overflowId));
+        assertEquals(CancelAck.TOMBSTONED, channel.cancel(target(prefill.getGrpcPort()), firstId, 2_000)
+                .get(2, TimeUnit.SECONDS).ack(), "the oldest existing fence must not be evicted");
+
+        EngineRpcService.EnqueueBatchResponsePB late = enqueue(prefill, batch(9403, slot(0,
+                inputWithDecode(firstId, 10, decodeServices.get(0).getGrpcPort()))));
+        assertEquals(0, late.getSuccessesCount());
+        assertEquals(1, late.getErrorsCount());
+        assertEquals(8429L, late.getErrors(0).getErrorInfo().getErrorCode());
+        assertEquals(0L, prefill.getAcceptedCount());
+        assertEquals(0, prefill.getInflightCount());
+    }
+
+    @Test
+    void prunedAdmissionHistoryCannotLabelAnUnknownRequestAsAbsent() throws Exception {
+        startCluster(model("10"), 1, 1);
+        JavaMockEngineCluster.FastRpcService prefill = prefillServices.get(0);
+        EngineCancelChannel channel = new MockEngineCancelChannel(services);
+        int capacity = engineHistoryCapacity("LIFECYCLE_CAP");
+        long firstId = 600_000L;
+        // Populate through the real bounded-history bookkeeping, without
+        // creating ten thousand unrelated running engine tasks for this unit
+        // boundary. The Cancel classifier and channel remain unmodified.
+        var recordStart = JavaMockEngineCluster.FastRpcService.class.getDeclaredMethod(
+                "recordLifecycleStart", long.class, long.class, String.class);
+        recordStart.setAccessible(true);
+        var historyPruned = JavaMockEngineCluster.FastRpcService.class.getDeclaredField(
+                "admissionHistoryPruned");
+        historyPruned.setAccessible(true);
+        long knownRunningId = firstId - 1;
+        recordStart.invoke(prefill, knownRunningId, 9500L, "enqueue_batch");
+        assertFalse(historyPruned.getBoolean(prefill));
+        assertEquals(CancelAck.NOT_FOUND, channel.cancel(target(prefill.getGrpcPort()), knownRunningId, 2_000)
+                .get(2, TimeUnit.SECONDS).ack(),
+                "a known running lifecycle alone proves prior admission, before any pruning");
+        assertFalse(prefill.isAbsentEnqueueFenced(knownRunningId));
+        assertFalse(historyPruned.getBoolean(prefill), "the running-lifecycle assertion cannot rely on pruning");
+        for (int i = 0; i <= capacity; i++) {
+            recordStart.invoke(prefill, firstId + i, 9500L, "enqueue_batch");
+        }
+        assertTrue(historyPruned.getBoolean(prefill));
+
+        long[] uncertainIds = {firstId, firstId + capacity, firstId + capacity + 1};
+        for (long requestId : uncertainIds) {
+            CancelOutcome outcome = channel.cancel(target(prefill.getGrpcPort()), requestId, 2_000)
+                    .get(2, TimeUnit.SECONDS);
+            assertEquals(CancelAck.NOT_FOUND, outcome.ack(),
+                    "pruned, still-known, and unknown IDs must not become absent fences: " + requestId);
+            assertFalse(prefill.isAbsentEnqueueFenced(requestId));
+        }
+        assertEquals(0L, prefill.getAcceptedCount());
+        assertEquals(0, prefill.getInflightCount());
+    }
+
+    private static int engineHistoryCapacity(String fieldName) throws ReflectiveOperationException {
+        var capacity = JavaMockEngineCluster.FastRpcService.class.getDeclaredField(fieldName);
+        capacity.setAccessible(true);
+        return capacity.getInt(null);
     }
 
     @Test

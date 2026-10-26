@@ -7,6 +7,8 @@ import org.flexlb.balance.endpoint.PrefillEndpoint;
 import org.flexlb.balance.scheduler.DefaultBatchDispatcher;
 import org.flexlb.balance.scheduler.FlexlbBatchScheduler;
 import org.flexlb.balance.scheduler.Router;
+import org.flexlb.balance.scheduler.priority.EngineCancelChannel;
+import org.flexlb.balance.scheduler.priority.GrpcEngineCancelChannel;
 import org.flexlb.cache.core.EngineLocalView;
 import org.flexlb.cache.core.GlobalCacheIndex;
 import org.flexlb.config.ConfigService;
@@ -37,6 +39,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BooleanSupplier;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
@@ -81,6 +84,7 @@ public abstract class FlexLBMockTestBase {
     protected DefaultBatchDispatcher dispatcher;
     protected BatchSchedulerReporter reporter;
     protected EngineWorkerStatus engineWorkerStatus;
+    protected final AtomicLong cancelAttempts = new AtomicLong();
 
     private NioEventLoopGroup eventLoopGroup;
     private ThreadPoolExecutor grpcExecutor;
@@ -192,7 +196,7 @@ public abstract class FlexLBMockTestBase {
         // 11. Create real scheduler
         scheduler = new FlexlbBatchScheduler(
                 configService, router,
-                endpointRegistry, dispatcher, reporter, null, null);
+                endpointRegistry, dispatcher, reporter, null, null, createCancelChannel());
 
         // 12. Register prefill endpoint with the real scheduler as BatchDecisionHandler
         endpointRegistry.ensureEndpoint(RoleType.PREFILL, prefillIpPort, prefillWs);
@@ -222,6 +226,9 @@ public abstract class FlexLBMockTestBase {
 
         if (scheduler != null) {
             scheduler.shutdown();
+        }
+        if (dispatcher != null) {
+            dispatcher.shutdown();
         }
         if (mockPrefillWorker != null) {
             mockPrefillWorker.stop();
@@ -268,9 +275,58 @@ public abstract class FlexLBMockTestBase {
         Router fixedRouter = mock(Router.class);
         when(fixedRouter.route(any(BalanceContext.class))).thenAnswer(inv -> {
             BalanceContext ctx = inv.getArgument(0);
-            return successRoute(ctx.getRequestId());
+            return reserveDecodeForRoute(ctx, successRoute(ctx.getRequestId()));
         });
         return fixedRouter;
+    }
+
+    /** Mirror the production router's reservation without replacing the endpoint ledger. */
+    protected Response reserveDecodeForRoute(BalanceContext ctx, Response response) {
+        for (ServerStatus server : response.getServerStatus()) {
+            if (server.getRole() == RoleType.DECODE) {
+                DecodeEndpoint endpoint = endpointRegistry.getDecode(
+                        server.getServerIp() + ":" + server.getHttpPort());
+                if (endpoint == null) {
+                    throw new IllegalStateException("route points to an unregistered Decode endpoint");
+                }
+                long seqLen = ctx.getRequest().getSeqLen();
+                long expected = seqLen + ctx.getRequest().getMaxNewTokens();
+                if (endpoint.realKvTotal() > 0) {
+                    expected = Math.min(expected, endpoint.realKvTotal());
+                }
+                endpoint.reserve(ctx.getRequestId(), seqLen, expected,
+                        ctx.getPriority(), ctx.getDeadlineMs());
+            }
+        }
+        return response;
+    }
+
+    private EngineCancelChannel createCancelChannel() {
+        EngineCancelChannel transport = new GrpcEngineCancelChannel(grpcClient);
+        return new EngineCancelChannel() {
+            @Override
+            public boolean isSupported(DecodeEndpoint endpoint) {
+                return transport.isSupported(endpoint);
+            }
+
+            @Override
+            public CompletableFuture<CancelOutcome> cancel(CancelTarget target,
+                                                            long requestId, long timeoutMs) {
+                cancelAttempts.incrementAndGet();
+                return transport.cancel(target, requestId, timeoutMs);
+            }
+        };
+    }
+
+    protected static void awaitCondition(BooleanSupplier condition, long timeoutMs, String message)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        while (!condition.getAsBoolean()) {
+            if (System.nanoTime() >= deadline) {
+                throw new AssertionError(message);
+            }
+            Thread.sleep(5);
+        }
     }
 
     /**

@@ -237,7 +237,7 @@ final class AutoTpmE2EHarness implements AutoCloseable {
             }
         };
         scheduler = new FlexlbBatchScheduler(configService, router,
-                endpointRegistry, dispatcher, reporter, priorityScheduler, null);
+                endpointRegistry, dispatcher, reporter, priorityScheduler, null, cancelChannel);
         schedulerRef.set(scheduler);
 
         for (JavaMockEngineCluster.FastRpcService svc : prefillEngines) {
@@ -392,7 +392,6 @@ final class AutoTpmE2EHarness implements AutoCloseable {
     private void pumpEngine(JavaMockEngineCluster.FastRpcService svc) {
         int port = svc.getGrpcPort();
         EngineRpcService.WorkerStatusPB status = workerStatus(svc, pumpCursor.get(port));
-        pumpCursor.put(port, status.getLatestFinishedVersion());
 
         boolean isDecode = decodeEngines.contains(svc);
         WorkerStatusResponse resp = new WorkerStatusResponse();
@@ -413,13 +412,22 @@ final class AutoTpmE2EHarness implements AutoCloseable {
         }
         resp.setFinishedTaskInfo(finished);
 
-        scheduler.onWorkerStatusUpdate(resp);
+        // Match GrpcWorkerStatusRunner: the role endpoint calibrates its own
+        // ledger before the scheduler consumes the same authoritative report.
+        // Successful Prefill completion is not a request terminal in the
+        // scheduler; only PrefillEndpoint calibration releases that batch.
+        WorkerStatus ws = statusByPort.get(port);
+        ws.getAvailableKvCacheTokens().set(status.getAvailableKvCache());
+        ws.getTotalKvCacheTokens().set(status.getTotalKvCache());
         if (isDecode) {
-            WorkerStatus ws = statusByPort.get(port);
-            ws.getAvailableKvCacheTokens().set(status.getAvailableKvCache());
             endpointRegistry.getDecode(ipPortByEnginePort.get(port))
                     .onWorkerStatusUpdate(ws, resp);
+        } else {
+            endpointRegistry.getPrefill(ipPortByEnginePort.get(port))
+                    .onWorkerStatusUpdate(ws, resp);
         }
+        scheduler.onWorkerStatusUpdate(resp);
+        pumpCursor.put(port, status.getLatestFinishedVersion());
     }
 
     static TaskInfo toTaskInfo(EngineRpcService.TaskInfoPB task) {

@@ -1,6 +1,8 @@
 package org.flexlb.mockengine;
 
 import io.grpc.stub.StreamObserver;
+import org.flexlb.balance.scheduler.RequestLifecycleState;
+import org.flexlb.dao.loadbalance.AdmissionRejectReason;
 import org.flexlb.dao.loadbalance.Response;
 import org.flexlb.dao.loadbalance.StrategyErrorType;
 import org.flexlb.engine.grpc.EngineRpcService;
@@ -26,7 +28,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * enqueueErrorMessage、enqueueDelayMs、generateDelayMs、generateError、fetchError、
  * noRespond、kvPressureTokens、queueDepthLimit、crashAfterNRequests。
  *
- * <p>控制面（enqueueBatch）故障走真实调度器栈断言 8510 终态传播；数据面
+ * <p>控制面（enqueueBatch）明确拒绝走 8510，缺失 ACK 则等待引擎 fence 后才结算；数据面
  * （generate_stream/fetch_response）故障不经过 LB 控制面，用直连 RPC 断言
  * mock 行为，同时验证调度器路径不受影响。
  *
@@ -267,7 +269,7 @@ class FaultInjectionE2ETest {
     @Test
     @Timeout(30)
     void c09_crash_after_n_requests_yields_missing_ack_and_other_engine_survives() throws Exception {
-        try (AutoTpmE2EHarness h = new AutoTpmE2EHarness(BASE_PORT + 80, 2, 1, "5", 1.0, false)) {
+        try (AutoTpmE2EHarness h = new AutoTpmE2EHarness(BASE_PORT + 80, 2, 1, "5", 1.0, true)) {
             arm(h);
             JavaMockEngineCluster.FastRpcService prefill = h.prefillEngines.get(0);
             prefill.setFaultConfig(FaultInjectionConfig.builder()
@@ -276,21 +278,71 @@ class FaultInjectionE2ETest {
 
             Response first = submitTo(h, 0, 9901);
             assertTrue(first.isSuccess(), "requests before the crash threshold succeed");
+            AutoTpmE2EHarness.await(() -> h.scheduler.getInflightSize() == 0
+                            && h.prefillEndpoint(0).getInflightBatchCount() == 0
+                            && h.decodeEndpoint(0).getInflightCount() == 0,
+                    5_000, "the first real request must finish before measuring uncertain ownership");
 
-            // 第 2 个 enqueue 触发 crash：空响应（无 ack）→ 8510 missing ack
-            Response crashed = submitTo(h, 0, 9902);
-            assertFalse(crashed.isSuccess());
-            assertEquals(StrategyErrorType.BATCH_DISPATCH_FAILED.getErrorCode(), crashed.getCode());
-            assertTrue(crashed.getErrorMessage().contains("missing ack"), crashed.getErrorMessage());
-            assertTrue(prefill.isStopped(), "engine is down after the crash threshold");
+            CountDownLatch allowFence = new CountDownLatch(1);
+            prefill.setCancelFenceGate(allowFence);
+            try {
+                h.prefillSelector = ctx -> 0;
+                CompletableFuture<Response> missingAck = h.scheduler.submit(h.context(9902, 50));
+                AutoTpmE2EHarness.await(() -> prefill.getPriorityCancelAttempts() > 0,
+                        2_000, "missing ack must invoke the engine's actual Cancel path");
+                assertTrue(prefill.isStopped(), "the second enqueue triggered the crash");
+                assertFalse(missingAck.isDone(), "an empty ack alone cannot release engine ownership");
+                assertEquals(1, h.scheduler.getInflightSize());
+                assertEquals(1, h.prefillEndpoint(0).getInflightBatchCount());
+                assertEquals(1, h.decodeEndpoint(0).getInflightCount());
+                assertFalse(prefill.isAbsentEnqueueFenced(9902));
 
-            // crash 后的请求继续明确失败（调度器不崩溃、不挂起）
-            Response afterCrash = submitTo(h, 0, 9903);
-            assertFalse(afterCrash.isSuccess());
-            assertEquals(StrategyErrorType.BATCH_DISPATCH_FAILED.getErrorCode(), afterCrash.getCode());
+                Response healthy = submitTo(h, 1, 9904);
+                assertTrue(healthy.isSuccess(), "reconciliation must not block the healthy engine");
 
-            Response healthy = submitTo(h, 1, 9904);
-            assertTrue(healthy.isSuccess(), "the crash never spreads to the healthy engine");
+                allowFence.countDown();
+                Response crashed = missingAck.get(5, TimeUnit.SECONDS);
+                assertFalse(crashed.isSuccess());
+                assertEquals(StrategyErrorType.RESOURCE_EXHAUSTED.getErrorCode(), crashed.getCode());
+                assertEquals(AdmissionRejectReason.RESOURCE_EXHAUSTED, crashed.getAdmissionRejectReason());
+                assertEquals(RequestLifecycleState.TIMED_OUT, h.scheduler.getRequestState(9902L, 0).state());
+                assertTrue(crashed.getErrorMessage().contains("engine fenced late enqueue"));
+                assertTrue(prefill.isAbsentEnqueueFenced(9902));
+
+                Response afterCrash = submitTo(h, 0, 9903);
+                assertFalse(afterCrash.isSuccess());
+                assertEquals(StrategyErrorType.RESOURCE_EXHAUSTED.getErrorCode(), afterCrash.getCode());
+                assertEquals(RequestLifecycleState.TIMED_OUT, h.scheduler.getRequestState(9903L, 0).state());
+                assertTrue(prefill.isAbsentEnqueueFenced(9903));
+                AutoTpmE2EHarness.await(() -> h.scheduler.getInflightSize() == 0
+                                && h.prefillEndpoint(0).getInflightBatchCount() == 0
+                                && h.prefillEndpoint(1).getInflightBatchCount() == 0
+                                && h.decodeEndpoint(0).getInflightCount() == 0,
+                        5_000, "authoritative fencing and the healthy completion release all ledgers");
+
+                // The fault keeps the control owner alive. Restoring its data
+                // plane must not resurrect an ID already fenced during the crash.
+                prefill.clearFaultConfig();
+                prefill.setStopped(false);
+                EngineRpcService.EnqueueBatchRequestPB late = EngineRpcService.EnqueueBatchRequestPB.newBuilder()
+                        .setBatchId(h.scheduler.getRequestState(9902L, 0).batchId())
+                        .addDpSlots(EngineRpcService.EnqueueBatchDpSlotPB.newBuilder()
+                                .setDpRank(0)
+                                .addRequests(EngineRpcService.EnqueueBatchExternalInputPB.newBuilder()
+                                        .setInput(EngineRpcService.GenerateInputPB.parseFrom(
+                                                AutoTpmE2EHarness.generateInputBytes(9902, 128, 8)))))
+                        .build();
+                EngineRpcService.EnqueueBatchResponsePB rejected = AutoTpmE2EHarness.unary(
+                        observer -> prefill.enqueueBatch(late, observer));
+                assertEquals(0, rejected.getSuccessesCount());
+                assertEquals(1, rejected.getErrorsCount());
+                assertEquals(8429L, rejected.getErrors(0).getErrorInfo().getErrorCode());
+                assertEquals(1L, prefill.getAcceptedCount(), "only the pre-crash request was admitted");
+                assertEquals(0, prefill.getInflightCount());
+                assertFalse(prefill.getRequestStates().containsKey(9902L));
+            } finally {
+                allowFence.countDown();
+            }
         }
     }
 
