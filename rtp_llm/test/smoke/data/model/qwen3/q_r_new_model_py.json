@@ -5,6 +5,9 @@
         {
             "endpoint": "/v1/chat/completions",
             "query": {
+                "chat_template_kwargs": {
+                    "enable_thinking": true
+                },
                 "messages": [
                     {
                         "role": "user",
@@ -25,7 +28,8 @@
                         "index": 0,
                         "message": {
                             "role": "assistant",
-                            "content": "<think>\n嗯，用户让我以英语听力方法",
+                            "content": "",
+                            "reasoning_content": "嗯，用户让我以英语",
                             "partial": false
                         },
                         "finish_reason": "length"
@@ -34,13 +38,19 @@
                 "usage": {
                     "prompt_tokens": 16,
                     "total_tokens": 26,
-                    "completion_tokens": 10
+                    "completion_tokens": 10,
+                    "completion_tokens_details": {
+                        "reasoning_tokens": 6
+                    }
                 }
             }
         },
         {
             "endpoint": "/v1/chat/completions",
             "query": {
+                "chat_template_kwargs": {
+                    "enable_thinking": true
+                },
                 "messages": [
                     {
                         "role": "user",
@@ -61,7 +71,8 @@
                         "index": 0,
                         "message": {
                             "role": "assistant",
-                            "content": "<think>\n嗯，用户让我以英语听力方法",
+                            "content": "",
+                            "reasoning_content": "嗯，用户让我以英语",
                             "partial": false
                         },
                         "finish_reason": "length"
@@ -70,7 +81,10 @@
                 "usage": {
                     "prompt_tokens": 16,
                     "total_tokens": 26,
-                    "completion_tokens": 10
+                    "completion_tokens": 10,
+                    "completion_tokens_details": {
+                        "reasoning_tokens": 6
+                    }
                 }
             }
         }

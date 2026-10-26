@@ -5,6 +5,9 @@
         {
             "endpoint": "/v1/chat/completions",
             "query": {
+                "chat_template_kwargs": {
+                    "enable_thinking": true
+                },
                 "messages": [
                     {
                         "role": "user",
@@ -24,7 +27,8 @@
                         "index": 0,
                         "message": {
                             "role": "assistant",
-                            "content": "<think>\n嗯，用户问“你是谁”，我需要先确认他们想知道什么。可能他们想了解我的身份、功能或者开发背景。首先，我应该介绍自己是通义千问，由通义实验室研发的超大规模语言模型。然后，要说明我的主要功能，比如回答问题、创作文字、编程等，这样用户能知道我能帮他们做什么。另外，可能需要提到我支持多语言，这样国际用户也会觉得有用。还要注意语气"
+                            "content": "",
+                            "reasoning_content": "嗯，用户问“你是谁”，我需要先确认他们想知道什么。可能他们想了解我的身份、功能或者开发背景。首先，我应该介绍自己是通义千问，由通义实验室研发的超大规模语言模型。然后，要说明我的主要功能，比如回答问题、创作文字、编程等，这样用户能知道我能帮他们做什么。另外，可能需要提到我支持多语言，这样国际用户也会觉得有用。还要"
                         },
                         "finish_reason": "length"
                     }
@@ -32,7 +36,10 @@
                 "usage": {
                     "prompt_tokens": 10,
                     "total_tokens": 110,
-                    "completion_tokens": 100
+                    "completion_tokens": 100,
+                    "completion_tokens_details": {
+                        "reasoning_tokens": 96
+                    }
                 }
             }
         }

@@ -36,6 +36,9 @@
     {
       "endpoint": "/v1/chat/completions",
       "query": {
+        "chat_template_kwargs": {
+          "enable_thinking": true
+        },
         "messages": [
           {
             "role": "user",
@@ -59,8 +62,8 @@
             "index": 0,
             "message": {
               "role": "assistant",
-              "content": "<think>\nOkay, so the user is asking which Flask alternative is most similar to Django North in syntax. Hmm, first I need to make sure I understand what Django North is. Wait, Django North was a migration tool for Django, right? But I think it's been deprecated and replaced by Django's built-in migration system. Maybe the user is referring to Django's migration framework, or perhaps there's a confusion here. Let me check.\n\nAssuming the user meant Django's migration system, they",
-              "reasoning_content": null,
+              "content": "",
+              "reasoning_content": "Okay, so the user is asking which Flask alternative is most similar to Django North in syntax. Hmm, first I need to make sure I understand what Django North is. Wait, Django North was a migration tool for Django, right? But I think it's been deprecated and replaced by Django's built-in migration system. Maybe the user is referring to Django's migration framework, or perhaps there's a confusion here. Let me check.\n\nAssuming the user meant Django's migration system",
               "function_call": null,
               "tool_calls": null,
               "partial": false,
@@ -74,7 +77,9 @@
           "prompt_tokens": 21,
           "total_tokens": 121,
           "completion_tokens": 100,
-          "completion_tokens_details": null,
+          "completion_tokens_details": {
+            "reasoning_tokens": 96
+          },
           "prompt_tokens_details": null
         },
         "debug_info": null,
@@ -112,6 +117,9 @@
     {
       "endpoint": "/v1/chat/completions",
       "query": {
+        "chat_template_kwargs": {
+          "enable_thinking": true
+        },
         "messages": [
           {
             "role": "user",
@@ -135,8 +143,8 @@
             "index": 0,
             "message": {
               "role": "assistant",
-              "content": "<think>\nOkay, so the user is asking which Flask alternative is most similar to Django North in syntax. Hmm, first I need to make sure I understand what Django North is. Wait, Django North was a migration tool for Django, right? But I think it's been deprecated and replaced by Django's built-in migration system. Maybe the user is referring to Django's migration framework, or perhaps there's a confusion here. Let me check.\n\nAssuming the user meant Django's migration system, they",
-              "reasoning_content": null,
+              "content": "",
+              "reasoning_content": "Okay, so the user is asking which Flask alternative is most similar to Django North in syntax. Hmm, first I need to make sure I understand what Django North is. Wait, Django North was a migration tool for Django, right? But I think it's been deprecated and replaced by Django's built-in migration system. Maybe the user is referring to Django's migration framework, or perhaps there's a confusion here. Let me check.\n\nAssuming the user meant Django's migration system",
               "function_call": null,
               "tool_calls": null,
               "partial": false,
@@ -150,7 +158,9 @@
           "prompt_tokens": 21,
           "total_tokens": 121,
           "completion_tokens": 100,
-          "completion_tokens_details": null,
+          "completion_tokens_details": {
+            "reasoning_tokens": 96
+          },
           "prompt_tokens_details": {
             "audio_tokens": null,
             "cached_tokens": 16
