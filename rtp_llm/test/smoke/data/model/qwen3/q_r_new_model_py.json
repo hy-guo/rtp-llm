@@ -28,15 +28,15 @@
                         "index": 0,
                         "message": {
                             "role": "assistant",
-                            "content": "<think>\n嗯，用户让我以英语听力方法",
+                            "content": "当然可以！以下是围绕“英语听力方法”",
                             "partial": false
                         },
                         "finish_reason": "length"
                     }
                 ],
                 "usage": {
-                    "prompt_tokens": 16,
-                    "total_tokens": 26,
+                    "prompt_tokens": 20,
+                    "total_tokens": 30,
                     "completion_tokens": 10
                 }
             }
@@ -67,15 +67,15 @@
                         "index": 0,
                         "message": {
                             "role": "assistant",
-                            "content": "<think>\n嗯，用户让我以英语听力方法",
+                            "content": "当然可以！以下是围绕“英语听力方法”",
                             "partial": false
                         },
                         "finish_reason": "length"
                     }
                 ],
                 "usage": {
-                    "prompt_tokens": 16,
-                    "total_tokens": 26,
+                    "prompt_tokens": 20,
+                    "total_tokens": 30,
                     "completion_tokens": 10
                 }
             }
