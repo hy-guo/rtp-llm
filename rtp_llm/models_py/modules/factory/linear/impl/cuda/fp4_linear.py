@@ -41,7 +41,10 @@ class CudaFp4GEMMLinear(LinearBase):
 
         # Check quantization method
         quant_method = quant_config.get_method()
-        return quant_method == "modelopt_fp4"
+        return (
+            quant_method in ("modelopt_fp4", "modelopt_mixed")
+            and weight.dtype == torch.uint8
+        )
 
     @torch.inference_mode()
     def __init__(
@@ -102,7 +105,7 @@ class CudaFp4GEMMLinear(LinearBase):
                 input_scale_interleaved.view(torch.float8_e4m3fn),
                 self.weight_scales.view(torch.float8_e4m3fn),
                 self.alpha,
-                output_dtype
+                output_dtype,
             ).view(*output_shape)
         else:
             output = mm_fp4(
