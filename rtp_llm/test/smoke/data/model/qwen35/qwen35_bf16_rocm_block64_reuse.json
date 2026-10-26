@@ -1,6 +1,7 @@
 {
     "model_type": "qwen35_moe",
     "model_path": "/mnt/nas1/hf/Qwen3.5-35B-A3B",
+    "cache_publication_barrier": {"timeout_s": 10},
     "query_result": [
         {
             "query": {

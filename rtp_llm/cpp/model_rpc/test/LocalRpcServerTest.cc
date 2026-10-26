@@ -2,13 +2,16 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
 #include "rtp_llm/cpp/config/ConfigModules.h"
+#include "rtp_llm/cpp/model_rpc/GenerateContext.h"
 #include "rtp_llm/cpp/model_rpc/LocalRpcServer.h"
 #include "rtp_llm/cpp/model_rpc/PrefillRpcServer.h"
 #include "rtp_llm/cpp/normal_engine/NormalGenerateStream.h"
@@ -97,7 +100,8 @@ std::shared_ptr<MockGenerateStream> createMockStream() {
     return std::make_shared<MockGenerateStream>(input, model_config, RuntimeConfig{});
 }
 
-std::shared_ptr<NormalGenerateStream> createNormalStream() {
+template<typename Stream = NormalGenerateStream>
+std::shared_ptr<Stream> createNormalStream() {
     auto input             = std::make_shared<GenerateInput>();
     input->generate_config = std::make_shared<GenerateConfig>();
     input->begin_time_us   = autil::TimeUtility::currentTimeInMicroSeconds();
@@ -105,7 +109,224 @@ std::shared_ptr<NormalGenerateStream> createNormalStream() {
 
     ModelConfig model_config;
     model_config.max_seq_len = 3;
-    return std::make_shared<NormalGenerateStream>(input, model_config, RuntimeConfig{}, ResourceContext{}, nullptr);
+    return std::make_shared<Stream>(input, model_config, RuntimeConfig{}, ResourceContext{}, nullptr);
+}
+
+class CleanupObservedStream: public NormalGenerateStream {
+public:
+    using NormalGenerateStream::NormalGenerateStream;
+
+    std::future<void> cleanupPolling() {
+        return cleanup_polling_.get_future();
+    }
+
+    void observeCleanupOnCurrentThread() {
+        cleanup_thread_ = std::this_thread::get_id();
+        observing_.store(true, std::memory_order_release);
+    }
+
+    StreamState getStatus() const override {
+        const auto state = GenerateStream::getStatus();
+        if (observing_.load(std::memory_order_acquire) && std::this_thread::get_id() == cleanup_thread_
+            && state == StreamState::RUNNING && ++running_reads_ == 2) {
+            // A repeated RUNNING read proves cleanup has executed its cancellation decision.
+            cleanup_polling_.set_value();
+        }
+        return state;
+    }
+
+private:
+    std::thread::id            cleanup_thread_;
+    std::atomic<bool>          observing_{false};
+    mutable size_t            running_reads_{0};
+    mutable std::promise<void> cleanup_polling_;
+};
+
+class TestGenerateContext: public GenerateContext {
+public:
+    using GenerateContext::GenerateContext;
+    using GenerateContext::stopStream;
+};
+
+enum class ContextCleanupPath {
+    DESTRUCTOR,
+    STOP_STREAM
+};
+
+enum class RunningCleanupScenario {
+    GENERATE_DONE,
+    UNFINISHED,
+    EXECUTION_ERROR,
+    TIMEOUT_ERROR,
+    REMOTE_HANDOFF
+};
+
+void checkRunningContextCleanup(ContextCleanupPath path, RunningCleanupScenario scenario) {
+    SCOPED_TRACE(static_cast<int>(path));
+    SCOPED_TRACE(static_cast<int>(scenario));
+    auto stream = createNormalStream<CleanupObservedStream>();
+    stream->generate_status_->status.store(StreamState::RUNNING);
+    ErrorCode expected_error = ErrorCode::CANCELLED;
+    if (scenario == RunningCleanupScenario::GENERATE_DONE) {
+        stream->reportEvent(StreamEvents::GenerateDone);
+        expected_error = ErrorCode::NONE_ERROR;
+    } else if (scenario == RunningCleanupScenario::EXECUTION_ERROR) {
+        stream->reportError(ErrorCode::EXECUTION_EXCEPTION, "original execution failure");
+        expected_error = ErrorCode::EXECUTION_EXCEPTION;
+    } else if (scenario == RunningCleanupScenario::TIMEOUT_ERROR) {
+        stream->reportError(ErrorCode::GENERATE_TIMEOUT, "original timeout");
+        expected_error = ErrorCode::GENERATE_TIMEOUT;
+    } else if (scenario == RunningCleanupScenario::REMOTE_HANDOFF) {
+        stream->reportEvent(StreamEvents::NeedRemoteGenerate);
+    }
+    const auto original_status = stream->statusInfo();
+    if (scenario == RunningCleanupScenario::GENERATE_DONE || scenario == RunningCleanupScenario::REMOTE_HANDOFF) {
+        const auto consumer_result = stream->nextOutput(1);
+        ASSERT_FALSE(consumer_result.ok());
+        EXPECT_EQ(consumer_result.status().code(), ErrorCode::FINISHED);
+        EXPECT_EQ(stream->getStatus(), StreamState::RUNNING);
+        EXPECT_FALSE(stream->hasError());
+    }
+
+    auto                        meta = std::make_shared<RpcServerRuntimeMeta>();
+    kmonitor::MetricsReporterPtr metrics_reporter;
+    auto context = std::make_unique<TestGenerateContext>(0, 0, nullptr, metrics_reporter, meta);
+    context->setStream(stream);
+    auto cleanup_polling = stream->cleanupPolling();
+    auto cleanup = std::async(std::launch::async, [context = std::move(context), stream, path]() mutable {
+        stream->observeCleanupOnCurrentThread();
+        bool detached = true;
+        if (path == ContextCleanupPath::STOP_STREAM) {
+            context->stopStream();
+            detached = context->getStream() == nullptr;
+        }
+        context.reset();
+        return detached;
+    });
+
+    const auto polling_status = cleanup_polling.wait_for(std::chrono::seconds(5));
+    EXPECT_EQ(polling_status, std::future_status::ready);
+    if (polling_status == std::future_status::ready) {
+        EXPECT_EQ(cleanup.wait_for(std::chrono::milliseconds(0)), std::future_status::timeout);
+        EXPECT_EQ(stream->getStatus(), StreamState::RUNNING);
+        EXPECT_EQ(stream->statusInfo().code(), expected_error);
+        if (original_status.hasError()) {
+            EXPECT_EQ(stream->statusInfo().ToString(), original_status.ToString());
+        }
+        EXPECT_FALSE(stream->stream_cache_resource_->isResourceReleased());
+    }
+
+    // Always unblock cleanup, including after a failed observation or assertion.
+    stream->reportEvent(StreamEvents::GenerateDone);
+    EXPECT_EQ(stream->moveToNext(), StreamState::FINISHED);
+    const auto cleanup_status = cleanup.wait_for(std::chrono::seconds(5));
+    EXPECT_EQ(cleanup_status, std::future_status::ready);
+    if (cleanup_status == std::future_status::ready) {
+        EXPECT_TRUE(cleanup.get());
+    }
+    EXPECT_EQ(stream->getStatus(), StreamState::FINISHED);
+    EXPECT_EQ(stream->statusInfo().code(), expected_error);
+    if (original_status.hasError()) {
+        EXPECT_EQ(stream->statusInfo().ToString(), original_status.ToString());
+    }
+
+    const auto runtime = meta->getEngineScheduleInfo(-1);
+    ASSERT_EQ(runtime.finished_task_info_list.size(), 1u);
+    if (scenario == RunningCleanupScenario::GENERATE_DONE || original_status.hasError()
+        || path == ContextCleanupPath::DESTRUCTOR) {
+        EXPECT_EQ(runtime.finished_task_info_list[0].error_code, static_cast<int64_t>(expected_error));
+    }
+}
+
+TEST(LocalRpcServerTest, ContextCleanupPreservesPendingGenerateDoneUntilSchedulerCommit) {
+    for (const auto path : std::array{ContextCleanupPath::DESTRUCTOR, ContextCleanupPath::STOP_STREAM}) {
+        checkRunningContextCleanup(path, RunningCleanupScenario::GENERATE_DONE);
+    }
+}
+
+TEST(LocalRpcServerTest, ContextCleanupCancelsUnfinishedRunningStreamAndWaitsForScheduler) {
+    for (const auto path : std::array{ContextCleanupPath::DESTRUCTOR, ContextCleanupPath::STOP_STREAM}) {
+        checkRunningContextCleanup(path, RunningCleanupScenario::UNFINISHED);
+    }
+}
+
+TEST(LocalRpcServerTest, ContextCleanupPreservesExistingRunningError) {
+    for (const auto path : std::array{ContextCleanupPath::DESTRUCTOR, ContextCleanupPath::STOP_STREAM}) {
+        for (const auto scenario :
+             std::array{RunningCleanupScenario::EXECUTION_ERROR, RunningCleanupScenario::TIMEOUT_ERROR}) {
+            checkRunningContextCleanup(path, scenario);
+        }
+    }
+}
+
+TEST(LocalRpcServerTest, ContextCleanupDoesNotMistakeRemoteHandoffForGenerateDone) {
+    for (const auto path : std::array{ContextCleanupPath::DESTRUCTOR, ContextCleanupPath::STOP_STREAM}) {
+        checkRunningContextCleanup(path, RunningCleanupScenario::REMOTE_HANDOFF);
+    }
+}
+
+TEST(LocalRpcServerTest, ContextCleanupLeavesCommittedFinishedStreamUnchanged) {
+    for (const auto path : std::array{ContextCleanupPath::DESTRUCTOR, ContextCleanupPath::STOP_STREAM}) {
+        SCOPED_TRACE(static_cast<int>(path));
+        auto stream = createNormalStream();
+        stream->generate_status_->status.store(StreamState::RUNNING);
+        stream->reportEvent(StreamEvents::GenerateDone);
+        ASSERT_EQ(stream->moveToNext(), StreamState::FINISHED);
+        auto                        meta = std::make_shared<RpcServerRuntimeMeta>();
+        kmonitor::MetricsReporterPtr metrics_reporter;
+        {
+            TestGenerateContext context(0, 0, nullptr, metrics_reporter, meta);
+            context.setStream(stream);
+            if (path == ContextCleanupPath::STOP_STREAM) {
+                context.stopStream();
+                EXPECT_EQ(context.getStream(), nullptr);
+            }
+        }
+        EXPECT_FALSE(stream->hasError());
+        EXPECT_FALSE(stream->cancelIfNotFinished("late cancellation"));
+        EXPECT_EQ(stream->getStatus(), StreamState::FINISHED);
+    }
+}
+
+TEST(LocalRpcServerTest, ContextCleanupCancelsUnfinishedWaitingAndLoadingStreams) {
+    for (const auto path : std::array{ContextCleanupPath::DESTRUCTOR, ContextCleanupPath::STOP_STREAM}) {
+        for (const auto state : std::array{StreamState::WAITING, StreamState::LOADING_CACHE}) {
+            SCOPED_TRACE(static_cast<int>(path));
+            SCOPED_TRACE(static_cast<int>(state));
+            auto stream = createNormalStream();
+            stream->generate_status_->status.store(state);
+            stream->reportEvent(StreamEvents::GenerateDone);
+            auto                        meta = std::make_shared<RpcServerRuntimeMeta>();
+            kmonitor::MetricsReporterPtr metrics_reporter;
+            {
+                TestGenerateContext context(0, 0, nullptr, metrics_reporter, meta);
+                context.setStream(stream);
+                if (path == ContextCleanupPath::STOP_STREAM) {
+                    context.stopStream();
+                    EXPECT_EQ(context.getStream(), nullptr);
+                }
+            }
+            EXPECT_EQ(stream->getStatus(), state);
+            EXPECT_EQ(stream->statusInfo().code(), ErrorCode::CANCELLED);
+            const auto cancelled = stream->statusInfo().ToString();
+            EXPECT_FALSE(stream->cancelIfNotFinished("second cancellation"));
+            EXPECT_EQ(stream->statusInfo().ToString(), cancelled);
+        }
+    }
+}
+
+TEST(LocalRpcServerTest, GeneralReportErrorStillPublishesPostprocessingFailureAfterGenerateDone) {
+    auto stream = createNormalStream();
+    stream->generate_status_->status.store(StreamState::RUNNING);
+    stream->reportEvent(StreamEvents::GenerateDone);
+    EXPECT_FALSE(stream->cancelIfNotFinished("late cancellation"));
+    EXPECT_FALSE(stream->hasError());
+    stream->reportError(ErrorCode::EXECUTION_EXCEPTION, "postprocessing failed");
+    EXPECT_EQ(stream->statusInfo().code(), ErrorCode::EXECUTION_EXCEPTION);
+    const auto result = stream->nextOutput(1);
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.status().code(), ErrorCode::EXECUTION_EXCEPTION);
+    EXPECT_EQ(stream->getStatus(), StreamState::RUNNING);
 }
 
 ErrorResult<GenerateOutputs> wakeResult(WakeReason reason) {

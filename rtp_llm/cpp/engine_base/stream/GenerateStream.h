@@ -317,6 +317,8 @@ public:
     void reportErrorWithoutLock(ErrorCode error_code, const std::string& error_msg) {
         reportEventWithoutLock(StreamEvents::Error, error_code, error_msg);
     }
+    // Pending terminal events prevent cancellation; scheduler commit and resource release remain unchanged.
+    bool         cancelIfNotFinished(const std::string& reason);
     bool         hasEvent(StreamEvents::EventType event) const;
     virtual bool hasError() const;
     ErrorInfo    statusInfo();

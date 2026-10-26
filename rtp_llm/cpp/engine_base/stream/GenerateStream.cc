@@ -801,6 +801,15 @@ StreamState GenerateStream::moveToNext() {
     return state;
 }
 
+bool GenerateStream::cancelIfNotFinished(const std::string& reason) {
+    std::lock_guard<std::mutex> lock(*mutex_);
+    if (generate_status_->checkFinished()) {
+        return false;
+    }
+    reportErrorWithoutLock(ErrorCode::CANCELLED, reason);
+    return true;
+}
+
 bool GenerateStream::hasError() const {
     std::lock_guard<std::mutex> lock(*mutex_);
     return hasErrorWithoutLock();

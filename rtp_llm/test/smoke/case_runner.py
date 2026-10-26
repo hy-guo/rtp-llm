@@ -26,6 +26,11 @@ class _TensorEncoder(json.JSONEncoder):
 from collections import defaultdict
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
+from smoke.cache_publication import (
+    CachePublicationError,
+    fetch_cache_status,
+    run_cache_publication_pair,
+)
 from smoke.cache_status_comparer import CacheStatusComparer
 from smoke.classifier_comparer import ClassifierComparer
 from smoke.common_def import QueryStatus, SmokeException, Tracer
@@ -718,12 +723,21 @@ class CaseRunner(object):
             comparer_cls = self._get_comparer_cls(q_r, request_endpoint)
             prepared.append((q_idx, q_r, request_endpoint, comparer_cls))
 
-        def _run_one(item):
+        def _run_one(item, visit_retry_time=None):
             q_idx, q_r, request_endpoint, cls = item
             tracer = Tracer()
             try:
                 cls(
-                    server_manager, request_endpoint, q_r, tracer, self.batch_infer
+                    server_manager,
+                    request_endpoint,
+                    q_r,
+                    tracer,
+                    self.batch_infer,
+                    **(
+                        {"visit_retry_time": visit_retry_time}
+                        if visit_retry_time is not None
+                        else {}
+                    ),
                 ).run()
                 return (q_idx, QueryStatus.OK, "", tracer, None, "")
             except SmokeException as e:
@@ -739,7 +753,52 @@ class CaseRunner(object):
                 )
 
         results: list = [None] * len(prepared)
-        if self.parallel_qr > 1 and len(prepared) > 1:
+        if task_info.cache_publication_barrier is not None:
+            try:
+                if (
+                    len(prepared) != 2
+                    or self.parallel_qr != 1
+                    or self.concurrency_test
+                    or int(os.environ.get("STABILITY_REPEAT", "0")) > 0
+                ):
+                    raise CachePublicationError(
+                        "cache publication requires exactly one sequential "
+                        "producer and consumer, without stability repeats"
+                    )
+
+                def run_pair_query(index):
+                    result = _run_one(prepared[index], visit_retry_time=1)
+                    results[index] = result
+                    if result[1] != QueryStatus.OK:
+                        raise CachePublicationError(
+                            f"cache publication query {index} failed: {result[2]}"
+                        )
+                    return result
+
+                url = (
+                    f"http://127.0.0.1:{server_manager.port}"
+                    "/rtp_llm/cache_status"
+                )
+                run_cache_publication_pair(
+                    lambda: run_pair_query(0),
+                    lambda: run_pair_query(1),
+                    lambda timeout: fetch_cache_status(url, timeout),
+                    task_info.cache_publication_barrier.timeout_s,
+                )
+            except CachePublicationError as error:
+                if not results:
+                    raise SmokeException(QueryStatus.VALID_FAILED, str(error)) from error
+                for index, result in enumerate(results):
+                    if result is None:
+                        results[index] = (
+                            index,
+                            QueryStatus.VISIT_FAILED,
+                            str(error),
+                            Tracer(),
+                            None,
+                            "",
+                        )
+        elif self.parallel_qr > 1 and len(prepared) > 1:
             # Parallel dispatch — sleep_time_qr is intentionally ignored here.
             # Server's --concurrency_limit must be >= parallel_qr or requests
             # will queue server-side and we get no real speedup.

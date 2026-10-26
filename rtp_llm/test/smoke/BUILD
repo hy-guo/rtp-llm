@@ -16,6 +16,16 @@ py_test(
     ],
 )
 
+py_test(
+    name = "cache_publication_test",
+    srcs = [
+        "base_comparer.py",
+        "cache_publication.py",
+        "cache_publication_test.py",
+        "case_runner.py",
+    ],
+)
+
 exports_files([
     "entry.py",
     "data/prompt_candidates.json",

@@ -2,7 +2,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 import requests
 from pydantic import BaseModel
@@ -36,7 +36,8 @@ class BaseComparer(object):
         request_endpoint: str,
         q_r: Dict[str, Any],
         tracer: Tracer,
-        use_batch_scheduler: bool
+        use_batch_scheduler: bool,
+        visit_retry_time: Optional[int] = None,
     ):
         self.server_manager = server_manager
         self.request_endpoint = request_endpoint
@@ -44,6 +45,7 @@ class BaseComparer(object):
         self.qr_info = q_r
         self.tracer = tracer
         self.use_batch_scheduler = use_batch_scheduler
+        self.visit_retry_time = visit_retry_time
 
     def format_query(self, query_json: Dict[str, Any]) -> BaseModel:
         raise NotImplementedError()
@@ -124,7 +126,11 @@ class BaseComparer(object):
     def run(self):
         query_info: BaseModel = self.format_query(self.qr_info["query"])
         self.tracer.query = query_info
-        visit_retry_time = int(os.environ.get("VISIT_RETRY_TIME", 4))
+        visit_retry_time = (
+            self.visit_retry_time
+            if self.visit_retry_time is not None
+            else int(os.environ.get("VISIT_RETRY_TIME", 4))
+        )
         request_info = query_info.model_dump(exclude_defaults=True)
         self.maybe_set_concurrency(query_info)
         ret, res = self.server_manager.visit(

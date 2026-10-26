@@ -1,13 +1,17 @@
 from typing import Any, Dict, List, Optional, Union
 
 import prettytable as pt
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from smoke.common_def import QueryStatus
 
 
 class LoraUpdateInfo(BaseModel):
     update_lora_action: Dict[str, Any]
     update_response: List[Union[bool, str]]
+
+
+class CachePublicationBarrierConfig(BaseModel):
+    timeout_s: float = Field(default=10.0, gt=0, le=60)
 
 
 class TaskInfo(BaseModel):
@@ -21,6 +25,8 @@ class TaskInfo(BaseModel):
     update_lora_infos: Optional[List[LoraUpdateInfo]] = None
     taskinfo_rel_path: str = ""
     grammar_constraint_only: bool = False
+    # Only two-query, sequential producer/consumer fixtures may opt in.
+    cache_publication_barrier: Optional[CachePublicationBarrierConfig] = None
 
 
 class TaskStates(BaseModel):
