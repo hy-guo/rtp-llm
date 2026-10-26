@@ -22,13 +22,13 @@ def sm120_suites():
             ),
             smoke_test(
                 name = "qwen2_mtp_int8_fp16_scale_tp2_sm120",
-                task_info = "data/model/qwen2_14b/q_r_mtp.json",
+                task_info = "data/model/qwen2_14b/q_r_mtp_fp16_scale_sm120.json",
                 smoke_args = "--act_type BF16 --warm_up 0 --ft_disable_custom_ar 1 --tp_size 2 --world_size 2 --max_seq_len 4096 --test_block_num 256 --enable_cuda_graph 1 --decode_capture_config '1,2,3,4,5' --sp_type eagle --gen_num_per_cycle 4 --sp_model_type qwen_2-mtp --sp_checkpoint_path /mnt/nas1/mtp_reg/qwen2_14b_draft/ --enable_int8_allreduce_fp16_scale true",
                 gpu_type = ["RTX_5000_PRO_CU13", "RTX_5000_PRO"],
             ),
             smoke_test(
                 name = "qwen2_mtp_int8_bf16_scale_tp2_sm120",
-                task_info = "data/model/qwen2_14b/q_r_mtp.json",
+                task_info = "data/model/qwen2_14b/q_r_mtp_sm120.json",
                 smoke_args = "--act_type BF16 --warm_up 0 --ft_disable_custom_ar 1 --tp_size 2 --world_size 2 --max_seq_len 4096 --test_block_num 256 --enable_cuda_graph 1 --decode_capture_config '1,2,3,4,5' --sp_type eagle --gen_num_per_cycle 4 --sp_model_type qwen_2-mtp --sp_checkpoint_path /mnt/nas1/mtp_reg/qwen2_14b_draft/ --enable_int8_allreduce_fp16_scale false",
                 gpu_type = ["RTX_5000_PRO_CU13", "RTX_5000_PRO"],
             ),
