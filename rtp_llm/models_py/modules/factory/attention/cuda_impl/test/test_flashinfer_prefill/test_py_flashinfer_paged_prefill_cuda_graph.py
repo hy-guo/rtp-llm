@@ -31,13 +31,25 @@ class _PrefillPagedCudaGraphTestMixin:
     """Shared setup for BASE and FP8 CUDA graph tests."""
 
     def _make_inputs(
-        self, input_lengths, prefix_lengths, with_copy_params=False, max_seq_len=0
+        self,
+        input_lengths,
+        prefix_lengths,
+        with_copy_params=False,
+        max_seq_len=0,
+        max_batch_size=None,
     ):
         """Create PyAttentionInputs for prefill (single or multi batch)."""
         if isinstance(input_lengths, int):
             input_lengths = [input_lengths]
             prefix_lengths = [prefix_lengths]
 
+        live_batch_size = len(input_lengths)
+        if with_copy_params and max_batch_size is not None:
+            self.assertGreaterEqual(max_batch_size, live_batch_size)
+            padding = max_batch_size - live_batch_size
+            # Match the graph runner's fixed capture buffers and zeroed inactive rows.
+            input_lengths = list(input_lengths) + [0] * padding
+            prefix_lengths = list(prefix_lengths) + [0] * padding
         batch_size = len(input_lengths)
         inp = PyAttentionInputs()
         inp.is_cuda_graph = with_copy_params
@@ -77,7 +89,7 @@ class _PrefillPagedCudaGraphTestMixin:
             ms = max_seq_len if max_seq_len > 0 else max(input_lengths)
             cp = PyPrefillCudaGaphCopyParams()
             cp.cuda_graph_prefill_batch_size = torch.tensor(
-                [batch_size], dtype=torch.int32
+                [live_batch_size], dtype=torch.int32
             ).pin_memory()
             cp.max_seq_len = ms
             cp.max_batch_size = batch_size
@@ -160,13 +172,33 @@ class _PrefillPagedCudaGraphTestMixin:
         )
         cg_op = PyFlashinferPrefillPagedAttnOp(config.attn_configs, cg_init)
         cg_op.prepare(cg_init)
-        cg_replay = self._make_inputs(input_lengths, prefix_lengths, True, max_seq_len)
+        cg_replay = self._make_inputs(
+            input_lengths,
+            prefix_lengths,
+            True,
+            max_seq_len,
+            max_batch_size=len(capture_input_lengths),
+        )
         cg_op.prepare(cg_replay, forbid_realloc=True)
+        page_indptr = cg_op.fmha_params.decode_page_indptr_d
+        self.assertEqual(page_indptr.numel(), len(capture_input_lengths) + 1)
+        if len(input_lengths) < len(capture_input_lengths):
+            padding_indptr = page_indptr[len(input_lengths) :]
+            torch.testing.assert_close(
+                padding_indptr,
+                padding_indptr[:1].expand_as(padding_indptr),
+                rtol=0,
+                atol=0,
+            )
         cg_out = cg_op.forward(q, kv_cache)
 
         if verify_cast_buffer_reuse:
             cast_buf = cg_op._aligned_q_cast_buf
-            self.assertIsNotNone(cast_buf)
+            if cg_op.q_dtype == q.dtype:
+                self.assertIsNone(cast_buf)
+            else:
+                self.assertIsNotNone(cast_buf)
+                self.assertEqual(cast_buf.dtype, cg_op.q_dtype)
             first_out = cg_out.clone()
             replay_out = cg_op.forward(q, kv_cache)
             self.assertIs(cg_op._aligned_q_cast_buf, cast_buf)
