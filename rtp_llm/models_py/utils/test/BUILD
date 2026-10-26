@@ -1,3 +1,4 @@
+load("//bazel:gpu_exec_properties.bzl", "sm120_exec_properties")
 py_test (
     name = "arch_test",
     srcs = ["arch_test.py"],
@@ -6,7 +7,7 @@ py_test (
     ],
     env = {"GPU_COUNT": "1"},
     tags = ["RTX_5000_PRO"],
-    exec_properties = {'gpu':'RTX_5000_PRO', 'gpu_count':'1'},
+    exec_properties = sm120_exec_properties({'gpu':'RTX_5000_PRO', 'gpu_count':'1'}),
 )
 
 py_test (

@@ -1,3 +1,4 @@
+load("//bazel:gpu_exec_properties.bzl", "sm120_exec_properties")
 # Test configuration for PyFlashinferDecodeAttnOp
 
 load("@arch_config//:arch_select.bzl", "requirement")
@@ -96,9 +97,9 @@ flashinfer_attention_tests = [
         srcs = [test["main"]] + test["extra_srcs"],
         deps = flashinfer_test_deps,
         tags = [platform["gpu"]],
-        exec_properties = {
+        exec_properties = sm120_exec_properties({
             "gpu": platform["gpu"],
-        },
+        }),
     )
     for test in flashinfer_attention_tests
     for platform in flashinfer_platforms
@@ -167,9 +168,9 @@ py_test(
         "//conditions:default": []
     }),
     tags = ["RTX_5000_PRO"],
-    exec_properties = {
+    exec_properties = sm120_exec_properties({
         'gpu': 'RTX_5000_PRO',
-    },
+    }),
 )
 
 py_test(
@@ -211,9 +212,9 @@ py_test(
         "//conditions:default": []
     }),
     tags = ["RTX_5000_PRO"],
-    exec_properties = {
+    exec_properties = sm120_exec_properties({
         'gpu': 'RTX_5000_PRO',
-    },
+    }),
 )
 
 # Benchmark for FlashInfer tensor cores performance comparison
