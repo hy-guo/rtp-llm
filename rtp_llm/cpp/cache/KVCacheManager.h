@@ -62,6 +62,17 @@ public:
                                bool                           enable_reuse_cache,
                                int                            target_batch_size) const;
 
+    std::vector<KVCachePoolAdmissionEstimate> estimateIndependentPoolNeeds(const BatchKVCacheResource& resource,
+                                                                           int                         seq_len,
+                                                                           int                         common_seq_len,
+                                                                           int                         remaining_tokens,
+                                                                           int                         reserve_step,
+                                                                           bool enable_reuse_cache,
+                                                                           int  target_batch_size) const {
+        return allocator_->estimateIndependentPoolNeeds(
+            resource, seq_len, common_seq_len, remaining_tokens, reserve_step, enable_reuse_cache, target_batch_size);
+    }
+
     // 块操作相关
     void blockCopy(int src_block_index, int dest_block_index);
     void blockBatchCopy(const std::vector<BlockIdPair>& copy_mapping);

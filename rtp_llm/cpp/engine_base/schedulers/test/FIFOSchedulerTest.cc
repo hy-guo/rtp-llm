@@ -1256,6 +1256,377 @@ TEST_F(FIFOSchedulerTest, testMultiSequenceAdmissionMatchesPhysicalFreeBlockWate
     ASSERT_EQ(min_free_blocks, free_before_admission - static_cast<size_t>(estimated_peak));
 }
 
+TEST_F(FIFOSchedulerTest, testIndependentHcaStatePoolAdmitsLongPromptsByPhysicalTail) {
+    auto spec                          = test::makeResolvedOpaqueSpec(true, "hca_state", DataType::TYPE_FP32, 64, 256);
+    auto config                        = test::makeSingleGroupCacheConfig(spec, CacheGroupType::SWA, 1, 256);
+    config.use_independent_block_pools = true;
+    auto policies                      = config.groupPoliciesSnapshot();
+    policies[0].explicit_block_num     = 256;
+    policies[0].enable_prefix_reuse    = false;
+    policies[0].active_tail_blocks     = 1;
+    policies[0].validate_tail_blocks   = false;
+    config.setGroupPolicies(policies);
+    config.setGroupBlockLayout({256}, {spec->block_size_bytes()}, {spec->scale_block_size_bytes()});
+    auto manager = std::make_shared<KVCacheManager>(config);
+    ASSERT_TRUE(manager->init());
+    ResourceContext context;
+    context.cache_manager = manager;
+    context.reuse_cache   = true;
+    ModelConfig model;
+    model.max_seq_len                  = 32768;
+    model.attn_config.tokens_per_block = 256;
+    RuntimeConfig runtime;
+    runtime.max_generate_batch_size                     = 8;
+    runtime.fifo_scheduler_config.max_batch_tokens_size = 262144;
+    PDFusionRatioScheduler scheduler(runtime, model, makePDFusionPDSepConfig(), {}, {}, manager);
+    for (int i = 0; i < 8; ++i) {
+        ASSERT_TRUE(scheduler.enqueue(makeStream(std::vector<int>(16384, i + 1), model, runtime, context, 3)).ok());
+    }
+    auto prefill = scheduler.schedule();
+    ASSERT_TRUE(prefill.ok());
+    ASSERT_EQ(prefill.value().size(), 8);
+    EXPECT_EQ(manager->freeBlocksNum(), 255u - 8u);
+    EXPECT_EQ(scheduler.waitingStreamsSize(), 0);
+    for (const auto& stream : prefill.value()) {
+        stream->setIsContextStream(false);
+        stream->setSeqLength(16385);
+    }
+    for (int step = 0; step < 2; ++step) {
+        auto decode = scheduler.schedule();
+        ASSERT_TRUE(decode.ok());
+        ASSERT_EQ(decode.value().size(), 8);
+        for (const auto& stream : decode.value()) {
+            ASSERT_FALSE(stream->hasError());
+            stream->setSeqLength(stream->seqLength() + 1);
+            if (step == 1) {
+                stream->reportEvent(StreamEvents::GenerateDone);
+            }
+        }
+    }
+    EXPECT_TRUE(scheduler.schedule().value().empty());
+    EXPECT_TRUE(scheduler.empty());
+    EXPECT_EQ(manager->freeBlocksNum(), 255u);
+}
+
+TEST_F(FIFOSchedulerTest, testIndependentPoolKeepsMultiReturnCapacityWithOneStreamLimit) {
+    auto config                        = test::makeSimpleHybridMhaCacheConfig(4, 256, 4, DataType::TYPE_FP16);
+    config.use_independent_block_pools = true;
+    auto manager                       = std::make_shared<KVCacheManager>(config);
+    ASSERT_TRUE(manager->init());
+    ResourceContext context;
+    context.cache_manager = manager;
+    context.reuse_cache   = false;
+    ModelConfig model;
+    model.max_seq_len                  = 8192;
+    model.attn_config.tokens_per_block = 4;
+    RuntimeConfig runtime;
+    runtime.max_generate_batch_size                     = 1;
+    runtime.fifo_scheduler_config.max_batch_tokens_size = 8192;
+    PDFusionRatioScheduler scheduler(runtime, model, makePDFusionPDSepConfig(), {}, {}, manager);
+    auto                   stream = makeStream(std::vector<int>(8, 1), model, runtime, context, 80, 2);
+    ASSERT_TRUE(scheduler.enqueue(stream).ok());
+    auto prefill = scheduler.schedule();
+    ASSERT_TRUE(prefill.ok());
+    ASSERT_EQ(prefill.value().size(), 1);
+    stream->setIsContextStream(false);
+    for (int seq_len = 9; seq_len < 88; ++seq_len) {
+        stream->setSeqLength(seq_len);
+        auto batch = scheduler.schedule();
+        ASSERT_TRUE(batch.ok());
+        ASSERT_EQ(batch.value().size(), 1);
+        ASSERT_FALSE(stream->hasError());
+    }
+    stream->reportEvent(StreamEvents::GenerateDone);
+    EXPECT_TRUE(scheduler.schedule().value().empty());
+    EXPECT_TRUE(scheduler.empty());
+}
+
+TEST_F(FIFOSchedulerTest, testIndependentPoolAdmissionDoesNotBorrowOtherPoolCapacity) {
+    // Both prompts fit, but both complete lifetimes do not fit simultaneously in one pool.
+    // Admit both and verify decode waits at the real bottleneck, then resumes after completion.
+    for (bool full_bottleneck : {true, false}) {
+        SCOPED_TRACE(full_bottleneck);
+        auto config                        = test::makeSimpleHybridMhaCacheConfig(4, 64, 4, DataType::TYPE_FP16);
+        config.use_independent_block_pools = true;
+        auto policies                      = config.groupPoliciesSnapshot();
+        policies[0].explicit_block_num     = full_bottleneck ? 64U : 6U;
+        policies[1].explicit_block_num     = full_bottleneck ? 10U : 64U;
+        config.setGroupPolicies(policies);
+        config.setGroupBlockLayout({full_bottleneck ? 64U : 6U, full_bottleneck ? 10U : 64U},
+                                   {config.kvBlockStrideBytesForGroup(0), config.kvBlockStrideBytesForGroup(1)},
+                                   {0, 0});
+        auto manager = std::make_shared<KVCacheManager>(config);
+        ASSERT_TRUE(manager->init());
+        ASSERT_EQ(manager->cacheConfig().groupBlockNumsSnapshot(),
+                  (std::vector<uint32_t>{full_bottleneck ? 64U : 6U, full_bottleneck ? 10U : 64U}));
+        ResourceContext context;
+        context.cache_manager = manager;
+        context.reuse_cache   = false;
+        ModelConfig model;
+        model.max_seq_len                  = 8192;
+        model.attn_config.tokens_per_block = 4;
+        RuntimeConfig runtime;
+        runtime.max_generate_batch_size                     = 100;
+        runtime.fifo_scheduler_config.max_batch_tokens_size = 8192;
+        runtime.fifo_scheduler_config.decode_prefill_ratio  = "0";
+        PDFusionRatioScheduler scheduler(runtime, model, makePDFusionPDSepConfig(), {}, {}, manager);
+        auto                   first  = makeStream({1, 2, 3, 4, 5, 6, 7, 8}, model, runtime, context, 13);
+        auto                   second = makeStream({11, 12, 13, 14, 15, 16, 17, 18}, model, runtime, context, 13);
+        ASSERT_TRUE(scheduler.enqueue(first).ok());
+        ASSERT_TRUE(scheduler.enqueue(second).ok());
+        auto prefill = scheduler.schedule();
+        ASSERT_TRUE(prefill.ok());
+        ASSERT_EQ(prefill.value().size(), 2);
+        ASSERT_EQ(scheduler.waitingStreamsSize(), 0);
+        for (const auto& stream : prefill.value()) {
+            stream->setIsContextStream(false);
+            stream->setSeqLength(9);
+        }
+        bool saw_paused              = false;
+        bool resumed_after_first     = false;
+        bool delayed_release_checked = false;
+        for (int step = 0; step < 64 && !scheduler.empty(); ++step) {
+            auto decode = scheduler.schedule();
+            ASSERT_TRUE(decode.ok());
+            ASSERT_FALSE(first->hasError());
+            ASSERT_FALSE(second->hasError());
+            if (first->hasPendingAsyncBookkeeping()) {
+                EXPECT_TRUE(decode.value().empty());
+                first->decPendingAsyncBookkeepingAndMaybeRelease();
+                delayed_release_checked = true;
+            }
+            if (!first->hasEvent(StreamEvents::GenerateDone) && !second->hasEvent(StreamEvents::GenerateDone)) {
+                saw_paused |= decode.value().size() == 1;
+            }
+            for (const auto& stream : decode.value()) {
+                if (stream == second && first->hasEvent(StreamEvents::GenerateDone)) {
+                    resumed_after_first = true;
+                }
+                stream->setSeqLength(stream->seqLength() + 1);
+                if (stream->seqLength() == static_cast<int>(stream->maxTokenNum())) {
+                    if (full_bottleneck && stream == first) {
+                        first->incPendingAsyncBookkeeping();
+                    }
+                    stream->reportEvent(StreamEvents::GenerateDone);
+                }
+            }
+        }
+        EXPECT_TRUE(saw_paused);
+        EXPECT_TRUE(resumed_after_first);
+        EXPECT_EQ(delayed_release_checked, full_bottleneck);
+        EXPECT_TRUE(scheduler.empty());
+        EXPECT_TRUE(first->hasEvent(StreamEvents::GenerateDone));
+        EXPECT_TRUE(second->hasEvent(StreamEvents::GenerateDone));
+    }
+}
+
+TEST_F(FIFOSchedulerTest, testIndependentPoolAdmissionPreservesConcurrentWorkThatFits) {
+    auto config                        = test::makeSimpleHybridMhaCacheConfig(4, 64, 4, DataType::TYPE_FP16);
+    config.use_independent_block_pools = true;
+    auto manager                       = std::make_shared<KVCacheManager>(config);
+    ASSERT_TRUE(manager->init());
+    ResourceContext context;
+    context.cache_manager = manager;
+    ModelConfig model;
+    model.max_seq_len                  = 8192;
+    model.attn_config.tokens_per_block = 4;
+    RuntimeConfig runtime;
+    runtime.max_generate_batch_size                     = 100;
+    runtime.fifo_scheduler_config.max_batch_tokens_size = 8192;
+    PDFusionRatioScheduler scheduler(runtime, model, makePDFusionPDSepConfig(), {}, {}, manager);
+    for (int i = 0; i < 8; ++i) {
+        // Short prompts with generous output caps should batch even when the sum of those caps cannot fit.
+        ASSERT_TRUE(scheduler.enqueue(makeStream({i, i, i, i}, model, runtime, context, 61)).ok());
+    }
+    auto prefill = scheduler.schedule();
+    ASSERT_TRUE(prefill.ok());
+    ASSERT_EQ(prefill.value().size(), 8);
+    ASSERT_EQ(scheduler.waitingStreamsSize(), 0);
+}
+
+TEST_F(FIFOSchedulerTest, testIndependentPoolProgressWhenSparseReserveExactlyFits) {
+    auto config                        = test::makeSimpleHybridMhaCacheConfig(4, 64, 4, DataType::TYPE_FP16);
+    config.use_independent_block_pools = true;
+    auto policies                      = config.groupPoliciesSnapshot();
+    policies[0].explicit_block_num     = 9;
+    policies[1].explicit_block_num     = 64;
+    config.setGroupPolicies(policies);
+    config.setGroupBlockLayout(
+        {9, 64}, {config.kvBlockStrideBytesForGroup(0), config.kvBlockStrideBytesForGroup(1)}, {0, 0});
+    auto manager = std::make_shared<KVCacheManager>(config);
+    ASSERT_TRUE(manager->init());
+    ASSERT_EQ(manager->cacheConfig().groupBlockNumsSnapshot(), (std::vector<uint32_t>{9, 64}));
+    ResourceContext context;
+    context.cache_manager = manager;
+    context.reuse_cache   = false;
+    ModelConfig model;
+    model.max_seq_len                  = 8192;
+    model.attn_config.tokens_per_block = 4;
+    RuntimeConfig runtime;
+    runtime.max_generate_batch_size                     = 100;
+    runtime.fifo_scheduler_config.max_batch_tokens_size = 8192;
+    runtime.fifo_scheduler_config.decode_prefill_ratio  = "0";
+    PDFusionRatioScheduler         scheduler(runtime, model, makePDFusionPDSepConfig(), {}, {}, manager);
+    std::vector<GenerateStreamPtr> streams;
+    for (int i = 0; i < 6; ++i) {
+        auto stream = makeStream(std::vector<int>(8, i + 1), model, runtime, context, 13);
+        streams.push_back(stream);
+        ASSERT_TRUE(scheduler.enqueue(stream).ok());
+    }
+    auto prefill = scheduler.schedule();
+    ASSERT_TRUE(prefill.ok());
+    ASSERT_EQ(prefill.value().size(), 6);
+    // Six physical tails leave exactly two blocks for the peak growth of one stream.
+    // Counting the next appended slot again in that peak would stall every stream here.
+    ASSERT_EQ(streams.front()->estimateIndependentPoolNeeds()[0].available_blocks, 2);
+    for (const auto& stream : streams) {
+        stream->setIsContextStream(false);
+        stream->setSeqLength(9);
+    }
+    for (int step = 0; step < 128 && !scheduler.empty(); ++step) {
+        auto batch = scheduler.schedule();
+        ASSERT_TRUE(batch.ok());
+        ASSERT_TRUE(scheduler.empty() || !batch.value().empty()) << "decode made no progress";
+        for (const auto& stream : streams) {
+            ASSERT_FALSE(stream->hasError()) << stream->stopReason();
+        }
+        for (const auto& stream : batch.value()) {
+            stream->setSeqLength(stream->seqLength() + 1);
+            if (stream->seqLength() == static_cast<int>(stream->maxTokenNum())) {
+                stream->reportEvent(StreamEvents::GenerateDone);
+            }
+        }
+    }
+    EXPECT_TRUE(scheduler.empty());
+    for (const auto& stream : streams) {
+        EXPECT_TRUE(stream->hasEvent(StreamEvents::GenerateDone));
+        EXPECT_EQ(stream->seqLength(), stream->maxTokenNum());
+    }
+}
+
+TEST_F(FIFOSchedulerTest, testIndependentPoolDecodeUsesPublishedMtpAllocationBound) {
+    auto config                        = test::makeSimpleHybridMhaCacheConfig(4, 64, 4, DataType::TYPE_FP16);
+    config.use_independent_block_pools = true;
+    auto policies                      = config.groupPoliciesSnapshot();
+    policies[0].explicit_block_num     = 64;
+    policies[1].explicit_block_num     = 10;
+    config.setGroupPolicies(policies);
+    config.setGroupBlockLayout(
+        {64, 10}, {config.kvBlockStrideBytesForGroup(0), config.kvBlockStrideBytesForGroup(1)}, {0, 0});
+    auto manager = std::make_shared<KVCacheManager>(config);
+    ASSERT_TRUE(manager->init());
+    ASSERT_EQ(manager->cacheConfig().groupBlockNumsSnapshot(), (std::vector<uint32_t>{64, 10}));
+    ResourceContext context;
+    context.cache_manager = manager;
+    context.reuse_cache   = false;
+    ModelConfig model;
+    model.max_seq_len                  = 8192;
+    model.attn_config.tokens_per_block = 4;
+    RuntimeConfig runtime;
+    runtime.max_generate_batch_size                     = 100;
+    runtime.fifo_scheduler_config.max_batch_tokens_size = 8192;
+    PDFusionRatioScheduler scheduler(runtime, model, makePDFusionPDSepConfig(), {}, {}, manager);
+    auto                   first  = makeStream({1, 2, 3, 4, 5, 6, 7, 8}, model, runtime, context, 13);
+    auto                   second = makeStream({11, 12, 13, 14, 15, 16, 17, 18}, model, runtime, context, 13);
+    // Construct the admitted state directly to check decode gating independently of admission policy.
+    for (const auto& stream : {first, second}) {
+        stream->reportEvent(StreamEvents::CanRun);
+        ASSERT_EQ(stream->moveToNext(), StreamState::RUNNING);
+        scheduler.running_streams_.push_back(stream);
+    }
+    first->setIsContextStream(false);
+    second->setIsContextStream(false);
+    first->setSeqLength(9);
+    // The worker still exposes seqLength=8, but the next speculative iteration needs two more FULL blocks.
+    GenerateStream::MtpAsyncDeviceState state;
+    state.next_real_seq_len = 13;
+    second->setMtpAsyncDeviceState(std::move(state));
+    auto decode = scheduler.schedule();
+    ASSERT_TRUE(decode.ok());
+    ASSERT_EQ(decode.value().size(), 1);
+    EXPECT_EQ(decode.value().front(), first);
+    EXPECT_FALSE(second->hasError());
+    first->reportEvent(StreamEvents::GenerateDone);
+    auto resumed = scheduler.schedule();
+    ASSERT_TRUE(resumed.ok());
+    ASSERT_EQ(resumed.value().size(), 1);
+    EXPECT_EQ(resumed.value().front(), second);
+    EXPECT_FALSE(second->hasError());
+}
+
+TEST_F(FIFOSchedulerTest, testIndependentPoolProgressWithMixedLifetimesAndSpeculativeBursts) {
+    for (bool full_bottleneck : {true, false}) {
+        for (bool reuse : {true, false}) {
+            for (int reserve_step : {0, 5}) {
+                SCOPED_TRACE(::testing::Message()
+                             << "full=" << full_bottleneck << " reuse=" << reuse << " reserve=" << reserve_step);
+                auto config = test::makeSimpleHybridMhaCacheConfig(4, 64, 4, DataType::TYPE_FP16);
+                config.use_independent_block_pools = true;
+                auto policies                      = config.groupPoliciesSnapshot();
+                policies[0].explicit_block_num     = full_bottleneck ? 64 : 30;
+                policies[1].explicit_block_num     = full_bottleneck ? 24 : 64;
+                config.setGroupPolicies(policies);
+                config.setGroupBlockLayout({full_bottleneck ? 64U : 30U, full_bottleneck ? 24U : 64U},
+                                           {config.kvBlockStrideBytesForGroup(0), config.kvBlockStrideBytesForGroup(1)},
+                                           {0, 0});
+                auto manager = std::make_shared<KVCacheManager>(config);
+                ASSERT_TRUE(manager->init());
+                ASSERT_EQ(manager->cacheConfig().groupBlockNumsSnapshot(),
+                          (std::vector<uint32_t>{full_bottleneck ? 64U : 30U, full_bottleneck ? 24U : 64U}));
+                ResourceContext context;
+                context.cache_manager = manager;
+                context.reuse_cache   = reuse;
+                ModelConfig model;
+                model.max_seq_len                  = 8192;
+                model.attn_config.tokens_per_block = 4;
+                RuntimeConfig runtime;
+                runtime.max_generate_batch_size                     = 100;
+                runtime.fifo_scheduler_config.max_batch_tokens_size = 8192;
+                runtime.fifo_scheduler_config.decode_prefill_ratio  = "3";
+                PDFusionRatioScheduler         scheduler(runtime, model, makePDFusionPDSepConfig(), {}, {}, manager);
+                const std::vector<int>         caps{49, 61, 45, 61, 61, 37};
+                const std::vector<int>         actual{49, 29, 37, 9, 33, 13};
+                std::vector<GenerateStreamPtr> streams;
+                for (size_t i = 0; i < caps.size(); ++i) {
+                    auto stream =
+                        makeStream(std::vector<int>(8, static_cast<int>(i + 1)), model, runtime, context, caps[i]);
+                    stream->setReserveStep(reserve_step);
+                    streams.push_back(stream);
+                    ASSERT_TRUE(scheduler.enqueue(stream).ok());
+                }
+                size_t largest_batch = 0;
+                for (int step = 0; step < 512 && !scheduler.empty(); ++step) {
+                    auto batch = scheduler.schedule();
+                    ASSERT_TRUE(batch.ok());
+                    largest_batch = std::max(largest_batch, batch.value().size());
+                    for (const auto& stream : streams) {
+                        ASSERT_FALSE(stream->hasError()) << stream->stopReason();
+                    }
+                    for (const auto& stream : batch.value()) {
+                        const size_t index = std::find(streams.begin(), streams.end(), stream) - streams.begin();
+                        const int    advance =
+                            stream->isContextStream() || reserve_step == 0 ? 1 : 1 + (step + index) % reserve_step;
+                        const int next = std::min(stream->seqLength() + advance, stream->inputLength() + actual[index]);
+                        stream->setIsContextStream(false);
+                        stream->setSeqLength(next);
+                        if (next == stream->inputLength() + actual[index]) {
+                            stream->reportEvent(StreamEvents::GenerateDone);
+                        }
+                    }
+                }
+                EXPECT_TRUE(scheduler.empty());
+                EXPECT_GE(largest_batch, 2);
+                for (const auto& stream : streams) {
+                    EXPECT_TRUE(stream->hasEvent(StreamEvents::GenerateDone));
+                    EXPECT_EQ(stream->seqLength(),
+                              stream->inputLength()
+                                  + actual[std::find(streams.begin(), streams.end(), stream) - streams.begin()]);
+                }
+            }
+        }
+    }
+}
+
 TEST_F(FIFOSchedulerTest, testHybridAdmissionAllowsUnderestimateAtDifferentBlockPeak) {
     // The logical-token peak is at t=0, where the block estimate is 13. The short stream's physical
     // block peak is 16 at t=9 because Hybrid block boundaries do not necessarily follow token volume.

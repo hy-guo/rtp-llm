@@ -1597,7 +1597,20 @@ TEST_F(HybridTypeKVCacheAllocatorTest, EstimateBatchPeakNeedBlocksAccountsForNon
     resource->setBatchBlocks(/*batch_id=*/0, /*group_id=*/1, {20, 21, 22, 24});
     resource->setBatchBlocks(/*batch_id=*/1, /*group_id=*/1, {20, 21, 23, 25});
 
-    // Existing blocks already cover this unaligned sequence length.
+    // The logical tables cover the sequence, but each missing active LINEAR tail needs a physical block.
+    EXPECT_EQ(allocator->estimateBatchPeakNeedBlocks(resource,
+                                                     /*seq_len=*/13,
+                                                     /*common_seq_len=*/8,
+                                                     /*remaining_tokens=*/0,
+                                                     /*reserve_step=*/0,
+                                                     /*enable_reuse_cache=*/false,
+                                                     /*target_batch_size=*/2),
+              2);
+
+    resource->setBatchBlocks(/*batch_id=*/0, /*group_id=*/0, {NULL_BLOCK_IDX, 10, 11, 13});
+    resource->setBatchBlocks(/*batch_id=*/1, /*group_id=*/0, {NULL_BLOCK_IDX, 10, 12, 14});
+
+    // Fully materialized active tails need no additional blocks at this sequence length.
     EXPECT_EQ(allocator->estimateBatchPeakNeedBlocks(resource,
                                                      /*seq_len=*/13,
                                                      /*common_seq_len=*/8,
