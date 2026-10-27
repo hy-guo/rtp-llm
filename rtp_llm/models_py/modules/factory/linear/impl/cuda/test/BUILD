@@ -1,3 +1,4 @@
+load("//bazel:gpu_exec_properties.bzl", "sm120_exec_properties")
 py_test_deps = [
     "//rtp_llm/models_py/standalone:py_standalone_testlib",
 ]
@@ -57,7 +58,7 @@ py_test(
     ],
     deps = py_test_deps,
     tags = ["RTX_5000_PRO"],
-    exec_properties = {'gpu':'RTX_5000_PRO'},
+    exec_properties = sm120_exec_properties({'gpu':'RTX_5000_PRO'}),
 )
 
 py_test(

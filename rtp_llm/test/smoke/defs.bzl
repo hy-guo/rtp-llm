@@ -1,3 +1,4 @@
+load("//bazel:gpu_exec_properties.bzl", "sm120_exec_properties")
 
 def extract_data(envs):
     data = []
@@ -133,10 +134,10 @@ def custom_smoke_test(name, main, smoke_args="", args=[], gpu_type=[], tags=[], 
         # Local runs inherit the shared root from the shell; CI overrides it with
         # --test_env. Declared here only: these are the remote-cache smoke cases.
         env_inherit = ["REMOTE_JIT_DIR"],
-        exec_properties = {
+        exec_properties = sm120_exec_properties({
             "gpu": gpu_type[0],
             "gpu_count": str(gpu_count),
-        },
+        }),
         tags = tags + SMOKE_CASE_TAGS + gpu_type,
         legacy_create_init = 0,
         visibility = ["//visibility:public"],
@@ -226,10 +227,10 @@ def smoke_test(name, task_info, tags=[], envs=[], gpu_type=[], data=[], smoke_ar
             "--kill_remote", str(kill_remote),
             "--concurrency_test", str(concurrency_test),
         ],
-        exec_properties = {
+        exec_properties = sm120_exec_properties({
             'gpu':gpu_type[0],
             'gpu_count': str(gpu_count),
-        },
+        }),
         env = {
             "GPU_COUNT": str(gpu_count),
         },

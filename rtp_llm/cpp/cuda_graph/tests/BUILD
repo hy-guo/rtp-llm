@@ -1,3 +1,4 @@
+load("//bazel:gpu_exec_properties.bzl", "sm120_exec_properties")
 load("//:def.bzl", "copts")
 load("@arch_config//:arch_select.bzl", "torch_deps")
 
@@ -152,5 +153,5 @@ py_test(
         "TEST_USING_DEVICE": "CUDA",
     },
     tags = ["RTX_5000_PRO"],
-    exec_properties = {"gpu": "RTX_5000_PRO"},
+    exec_properties = sm120_exec_properties({"gpu": "RTX_5000_PRO"}),
 )

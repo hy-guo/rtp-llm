@@ -1,3 +1,4 @@
+load("//bazel:gpu_exec_properties.bzl", "sm120_exec_properties")
 py_test (
     name = "silu_mul_masked_test",
     srcs = ["silu_mul_masked_test.py"],
@@ -48,7 +49,7 @@ py_test(
     deps = ["//rtp_llm/models_py/standalone:py_standalone_testlib"],
     env = {"GPU_COUNT": "1"},
     tags = ["RTX_5000_PRO"],
-    exec_properties = {"gpu": "RTX_5000_PRO", "gpu_count": "1"},
+    exec_properties = sm120_exec_properties({"gpu": "RTX_5000_PRO", "gpu_count": "1"}),
 )
 
 py_test(
@@ -57,7 +58,7 @@ py_test(
     deps = ["//rtp_llm/models_py/standalone:py_standalone_testlib"],
     env = {"GPU_COUNT": "1"},
     tags = ["manual", "open_skip", "RTX_5000_PRO"],
-    exec_properties = {"gpu": "RTX_5000_PRO", "gpu_count": "1"},
+    exec_properties = sm120_exec_properties({"gpu": "RTX_5000_PRO", "gpu_count": "1"}),
 )
 
 py_test(

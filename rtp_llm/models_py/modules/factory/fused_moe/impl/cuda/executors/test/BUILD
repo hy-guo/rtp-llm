@@ -1,3 +1,4 @@
+load("//bazel:gpu_exec_properties.bzl", "sm120_exec_properties")
 py_library(
     name = "fused_moe_executor_test_util",
     srcs = ["fused_moe_executor_test_util.py"],
@@ -48,7 +49,7 @@ py_test (
     ],
     env = {"GPU_COUNT": "1"},
     tags = ["open_skip", "RTX_5000_PRO"],
-    exec_properties = {'gpu':'RTX_5000_PRO', 'gpu_count':'1'},
+    exec_properties = sm120_exec_properties({'gpu':'RTX_5000_PRO', 'gpu_count':'1'}),
 )
 
 py_test (
@@ -63,7 +64,7 @@ py_test (
     # Intentionally runs in open-source CI: this is the SM120 correctness gate
     # for the production path, including packed UE8M0 and CUDA Graph replay.
     tags = ["RTX_5000_PRO"],
-    exec_properties = {'gpu':'RTX_5000_PRO', 'gpu_count':'1'},
+    exec_properties = sm120_exec_properties({'gpu':'RTX_5000_PRO', 'gpu_count':'1'}),
 )
 
 py_test (
@@ -76,7 +77,7 @@ py_test (
     ],
     env = {"GPU_COUNT": "1"},
     tags = ["manual", "open_skip", "RTX_5000_PRO"],
-    exec_properties = {'gpu':'RTX_5000_PRO', 'gpu_count':'1'},
+    exec_properties = sm120_exec_properties({'gpu':'RTX_5000_PRO', 'gpu_count':'1'}),
 )
 
 py_test (
@@ -122,7 +123,7 @@ py_test (
     ],
     env = {"GPU_COUNT": "1"},
     tags = ["open_skip", "RTX_5000_PRO"],
-    exec_properties = {'gpu':'RTX_5000_PRO', 'gpu_count':'1'},
+    exec_properties = sm120_exec_properties({'gpu':'RTX_5000_PRO', 'gpu_count':'1'}),
 )
 
 py_test (
