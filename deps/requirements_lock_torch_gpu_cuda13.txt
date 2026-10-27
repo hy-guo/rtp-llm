@@ -642,7 +642,6 @@ flash-mla @ https://rtp-maga.oss-cn-zhangjiakou.aliyuncs.com/miji/0430/flash_mla
     --hash=sha256:67bba01c854fe3b06397c297d49724e16029984a37124d05047a78ff48e7c44f
     # via -r internal_source/deps/requirements_torch_gpu_cuda13.txt
 flashinfer-python==0.6.9 \
-    --hash=sha256:044ed74698b5f6c1e719b32cf95189609166740076c11287e81a38450953de50 \
     --hash=sha256:46d013119ecd039a5844c4847325b3571f99cdd8fd9e00839bf008c67b15811a
     # via rtp-kernel
 fonttools==4.58.4 \

@@ -319,3 +319,13 @@ py_test(
         "gpu": "H20",
     },
 )
+
+# Scalar helper regression: real CUDA graph capture/replay with exact raw bits.
+py_test(
+    name = "flashinfer_bmm2_scale_cuda_graph_sm120_test",
+    srcs = ["flashinfer_bmm2_scale_cuda_graph_sm120_test.py"],
+    deps = ["//rtp_llm:torch"] + flashinfer_deps,
+    env = {"GPU_COUNT": "1"},
+    tags = ["RTX_5000_PRO"],
+    exec_properties = {"gpu": "RTX_5000_PRO_CU13", "gpu_count": "1"},
+)

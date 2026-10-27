@@ -18,9 +18,6 @@ class DeepGemmMaskedExecutorSM120Test(
         self.assertTrue(has_deep_gemm())
         self.assertTrue(is_deep_gemm_e8m0_used())
 
-    def test_no_fp8(self):
-        self.skipTest("SM120 DeepGEMM only supports the FP8/UE8M0 test path")
-
     def test_fp8(self):
         self._test_deepgemm_masked_executor(True)
 

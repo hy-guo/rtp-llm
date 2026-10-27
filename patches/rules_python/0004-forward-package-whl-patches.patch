@@ -1,0 +1,50 @@
+--- python/private/pypi/package_annotation.bzl
++++ python/private/pypi/package_annotation.bzl
+@@ -20,7 +20,8 @@
+         copy_executables = {},
+         data = [],
+         data_exclude_glob = [],
+-        srcs_exclude_glob = []):
++        srcs_exclude_glob = [],
++        whl_patches = {}):
+     """Annotations to apply to the BUILD file content from package generated from a `pip_repository` rule.
+ 
+     [cf]: https://github.com/bazelbuild/bazel-skylib/blob/main/docs/copy_file_doc.md
+@@ -31,6 +32,8 @@
+         copy_executables (dict, optional): A mapping of `src` and `out` files for
+             [@bazel_skylib//rules:copy_file.bzl][cf]. Targets generated here will also be flagged as
+             executable.
++        whl_patches (dict, optional): Explicit patch-label strings mapped to the
++            JSON arguments used by whl_library.whl_patches. Applies only to this package.
+         data (list, optional): A list of labels to add as `data` dependencies to the generated `py_library` target.
+         data_exclude_glob (list, optional): A list of exclude glob patterns to add as `data` to the generated
+             `py_library` target.
+@@ -46,4 +49,5 @@
+         data = data,
+         data_exclude_glob = data_exclude_glob,
+         srcs_exclude_glob = srcs_exclude_glob,
++        whl_patches = whl_patches,
+     ))
+--- python/private/pypi/whl_library.bzl
++++ python/private/pypi/whl_library.bzl
+@@ -304,9 +304,18 @@
+         if not rctx.delete("whl_file.json"):
+             fail("failed to delete the whl_file.json file")
+ 
+-    if rctx.attr.whl_patches:
++    whl_patches = dict(rctx.attr.whl_patches)
++    if rctx.attr.annotation:
++        annotation = json.decode(rctx.read(rctx.attr.annotation))
++        for patch_label, json_args in annotation.get("whl_patches", {}).items():
++            patch_file = Label(patch_label)
++            if patch_file in whl_patches:
++                fail("duplicate wheel patch in attr and annotation: {}".format(patch_label))
++            whl_patches[patch_file] = json_args
++
++    if whl_patches:
+         patches = {}
+-        for patch_file, json_args in rctx.attr.whl_patches.items():
++        for patch_file, json_args in whl_patches.items():
+             patch_dst = struct(**json.decode(json_args))
+             if whl_path.basename in patch_dst.whls:
+                 patches[patch_file] = patch_dst.patch_strip

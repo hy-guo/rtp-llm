@@ -1,4 +1,4 @@
-load("@rules_python//python:pip.bzl", "pip_parse")
+load("@rules_python//python:pip.bzl", "package_annotation", "pip_parse")
 
 PIP_EXTRA_ARGS = [
     "--cache-dir=~/.cache/pip",
@@ -52,6 +52,16 @@ def pip_deps():
     pip_parse(
         name = "pip_gpu_cuda13_torch",
         requirements_lock = "@rtp_deps//:requirements_lock_torch_gpu_cuda13.txt",
+        annotations = {
+            "flashinfer-python": package_annotation(
+                whl_patches = {
+                    str(Label("@rtp_llm//3rdparty/flashinfer:flashinfer-prefill-capture-safe.patch")): json.encode({
+                        "whls": ["flashinfer_python-0.6.9-py3-none-any.whl"],
+                        "patch_strip": 1,
+                    }),
+                },
+            ),
+        },
         python_interpreter = "/opt/conda310/bin/python3",
         extra_pip_args = PIP_EXTRA_ARGS + ["--quiet"],
         timeout = 3600,

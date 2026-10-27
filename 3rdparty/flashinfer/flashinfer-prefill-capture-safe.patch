@@ -1,0 +1,46 @@
+--- a/flashinfer/prefill.py
++++ b/flashinfer/prefill.py
+@@ -13,6 +13,8 @@
+ See the License for the specific language governing permissions and
+ limitations under the License.
+ """
++
++# Modified by RTP-LLM: graph-safe scale encoding with unchanged bit patterns.
+ 
+ import functools
+ import logging
+@@ -115,17 +117,19 @@
+     if data_dtype == torch.float16:
+         # Create int32 buffer on device, write FP16 value to lower 16 bits via view
+         result = torch.zeros(1, dtype=torch.int32, device=device)
+-        result.view(torch.float16)[0] = scale_bmm2
++        result.view(torch.float16)[:1].fill_(scale_bmm2)
+         return result
+     elif data_dtype == torch.bfloat16:
+         # Create int32 buffer on device, write BF16 value to lower 16 bits via view
+         result = torch.zeros(1, dtype=torch.int32, device=device)
+-        result.view(torch.bfloat16)[0] = scale_bmm2
++        result.view(torch.bfloat16)[:1].fill_(scale_bmm2)
+         return result
+     else:
+         # FP8, INT8, etc. use FP32 accumulation - create FP32 tensor and view as int32
+-        return torch.tensor([scale_bmm2], dtype=torch.float32, device=device).view(
+-            torch.int32
++        return (
++            torch.empty(1, dtype=torch.float32, device=device)
++            .fill_(scale_bmm2)
++            .view(torch.int32)
+         )
+ 
+ 
+--- a/flashinfer_python-0.6.9.dist-info/RECORD
++++ b/flashinfer_python-0.6.9.dist-info/RECORD
+@@ -22,7 +22,7 @@
+ flashinfer/green_ctx.py,sha256=SKR5WgUEU0KUzszc8t9--6u_1C119djwZeGmOkyW6Og,11633
+ flashinfer/page.py,sha256=3YJ-CjhD84sAFhdsjF-Nr4XtmR_FOxNMFRTrdXUkxGU,14377
+ flashinfer/pod.py,sha256=ReqfVh6fMdfRTfpCgmfbUWXtLHPRvf0BsdKMtFHacSg,46053
+-flashinfer/prefill.py,sha256=PyJzTvLWhf-a2b9j8cfZ0neMJ4t12SLSiM5lfxh0ne8,182605
++flashinfer/prefill.py,sha256=9TX71dA1VdN5V0DjDhva0Vf76kCdMZrMogBGlyuW5r4,182730
+ flashinfer/py.typed,sha256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU,0
+ flashinfer/rope.py,sha256=8Pbwn0Bbo_QQG50lsQE-cjW1n3p5FGwSz26s3mpbENM,58830
+ flashinfer/sampling.py,sha256=vmE9mdqKPNWRzdtLbsLARkHFeAjYbOd0L3unTUoq4XI,81739
