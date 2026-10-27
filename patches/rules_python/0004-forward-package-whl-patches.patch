@@ -1,3 +1,4 @@
+diff --git python/private/pypi/package_annotation.bzl python/private/pypi/package_annotation.bzl
 --- python/private/pypi/package_annotation.bzl
 +++ python/private/pypi/package_annotation.bzl
 @@ -20,7 +20,8 @@
@@ -25,6 +26,7 @@
          srcs_exclude_glob = srcs_exclude_glob,
 +        whl_patches = whl_patches,
      ))
+diff --git python/private/pypi/whl_library.bzl python/private/pypi/whl_library.bzl
 --- python/private/pypi/whl_library.bzl
 +++ python/private/pypi/whl_library.bzl
 @@ -304,9 +304,18 @@

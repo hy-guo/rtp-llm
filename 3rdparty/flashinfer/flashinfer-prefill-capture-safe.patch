@@ -1,3 +1,4 @@
+diff --git a/flashinfer/prefill.py b/flashinfer/prefill.py
 --- a/flashinfer/prefill.py
 +++ b/flashinfer/prefill.py
 @@ -13,6 +13,8 @@
@@ -33,6 +34,7 @@
          )
  
  
+diff --git a/flashinfer_python-0.6.9.dist-info/RECORD b/flashinfer_python-0.6.9.dist-info/RECORD
 --- a/flashinfer_python-0.6.9.dist-info/RECORD
 +++ b/flashinfer_python-0.6.9.dist-info/RECORD
 @@ -22,7 +22,7 @@
