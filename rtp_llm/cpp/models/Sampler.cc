@@ -1,3 +1,4 @@
+#include "rtp_llm/cpp/models/Pr1579Stage2Diagnostic.h"
 #include "rtp_llm/cpp/models/Sampler.h"
 #include <cstring>
 #include "rtp_llm/cpp/utils/DebugUtils.h"
@@ -108,6 +109,28 @@ SamplerOutput Sampler::forward(const SamplerInputs& inputs) {
 
     auto processor_errors = preprocessLogits(inputs);
 
+    pr1579_stage2::capture("sampler_input", [&](pybind11::dict& f) {
+        // Sampler has no model identity. Correlate actual rows/history with head
+        // offline; never label every Sampler instance as the target model.
+        f["role"] = "sampler";
+        f["step"] = static_cast<int64_t>(inputs.step);
+        f["batch_size"] = static_cast<int64_t>(inputs.batch_size);
+        f["vocab_size"] = static_cast<int64_t>(inputs.vocab_size);
+        f["before_exec_sample_greedy"] = true;
+        pr1579_stage2::tensor(f, "logits", inputs.logits);
+        pr1579_stage2::tensor(f, "input_token_ids", inputs.token_ids);
+        pr1579_stage2::tensor(f, "input_lengths", inputs.input_lengths);
+        pr1579_stage2::tensor(f, "sequence_lengths", inputs.sequence_lengths);
+        pr1579_stage2::tensor(f, "num_beams_in", inputs.num_beams_in);
+        pr1579_stage2::tensor(f, "num_beams_out", inputs.num_beams_out);
+        pr1579_stage2::tensor(f, "top_k", inputs.top_k);
+        pr1579_stage2::tensor(f, "top_p", inputs.top_p);
+        pr1579_stage2::tensor(f, "temperature", inputs.temperature);
+        pr1579_stage2::tensor(f, "do_sample", inputs.do_sample);
+        pr1579_stage2::tensor(f, "repetition_penalty", inputs.repetition_penalty);
+        pr1579_stage2::tensor(f, "presence_penalty", inputs.presence_penalty);
+        pr1579_stage2::tensor(f, "frequency_penalty", inputs.frequency_penalty);
+    });
     uint64_t max_seq_len   = inputs.token_ids.size(1);
     auto     num_beams_in  = inputs.num_beams_in.data_ptr<int64_t>();
     auto     num_beams_out = inputs.num_beams_out.data_ptr<int64_t>();
@@ -318,6 +341,14 @@ SamplerOutput Sampler::forward(const SamplerInputs& inputs) {
         from_batch_idx_out = to_batch_idx_out;
     }
 
+    pr1579_stage2::capture("sampler_output", [&](pybind11::dict& f) {
+        f["role"] = "sampler";
+        f["step"] = static_cast<int64_t>(inputs.step);
+        f["batch_size"] = static_cast<int64_t>(inputs.batch_size);
+        pr1579_stage2::tensor(f, "target_token_ids", all_token_ids_out);
+        pr1579_stage2::tensor(f, "success", all_success);
+        pr1579_stage2::tensor(f, "sequence_lengths", inputs.sequence_lengths);
+    });
     return SamplerOutput({std::move(all_token_ids_out),
                           std::move(all_cum_log_probs_out),
                           std::move(inputs.all_probs),

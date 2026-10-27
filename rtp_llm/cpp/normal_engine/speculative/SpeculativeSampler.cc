@@ -1,3 +1,4 @@
+#include "rtp_llm/cpp/models/Pr1579Stage2Diagnostic.h"
 #include "rtp_llm/cpp/normal_engine/speculative/SpeculativeSampler.h"
 #include <algorithm>
 #include <vector>
@@ -252,6 +253,18 @@ void SpeculativeSampler::batchSample(SpeculativeSamplerOutput&           sample_
     sample_output.accept_tokens = output_token_ids_d;
     sample_output.accept_len    = output_accepted_token_num_d;
 
+    pr1579_stage2::capture("rejection", [&](pybind11::dict& f) {
+        f["role"] = "target";
+        f["propose_step"] = static_cast<int64_t>(propose_step_);
+        f["batch_size"] = static_cast<int64_t>(batch_size);
+        f["before_logits_accept_cap"] = true;
+        f["draft_probs_point_mass"] = draft_probs_point_mass;
+        pr1579_stage2::tensor(f, "draft_token_ids", draft_token_ids_d_t);
+        pr1579_stage2::tensor(f, "target_token_ids", target_token_ids_d_t);
+        pr1579_stage2::tensor(f, "accept_len", sample_output.accept_len);
+        pr1579_stage2::tensor(f, "accept_tokens", sample_output.accept_tokens);
+        pr1579_stage2::tensor(f, "do_sample", do_sample_d);
+    });
     sample_output.accept_tokens_cpu = sample_output.accept_tokens.to(torch::kCPU, true);
     sample_output.accept_len_cpu    = sample_output.accept_len.to(torch::kCPU, true);
     sample_output.transfer_done_event->record(cuda_graph::graphGetCurrentStream());

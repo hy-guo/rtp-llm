@@ -1,3 +1,4 @@
+#include "rtp_llm/cpp/models/Pr1579Stage2Diagnostic.h"
 #include <algorithm>
 #include <condition_variable>
 #include <cstddef>
@@ -1014,6 +1015,20 @@ void GenerateStream::specUpdate(const StreamSpecUpdateInfo& update_info) {
     int nxt_cached_len   = seqLength() - 1;
     int accept_token_num = nxt_cached_len - cur_cached_len;
 
+    pr1579_stage2::capture("commit", [&](pybind11::dict& f) {
+        // This bookkeeping worker already owns ready host tokens. Record the
+        // actual clipped committed range, rather than the requested accept_len.
+        f["role"] = "target";
+        f["stream_id"] = static_cast<int64_t>(streamId());
+        f["seq_len_before"] = static_cast<int64_t>(cur_cached_len + 1);
+        f["seq_len_after"] = static_cast<int64_t>(nxt_cached_len + 1);
+        f["requested_num_new_tokens"] = static_cast<int64_t>(num_new_tokens);
+        f["accepted_draft_tokens"] = static_cast<int64_t>(update_info.accepted_draft_tokens);
+        f["propose_step"] = static_cast<int64_t>(update_info.speculative_propose_step);
+        f["history_commit_only"] = true;
+        pr1579_stage2::tensor(f, "committed_tokens",
+                             new_tokens.narrow(new_tokens.dim() - 1, 0, accept_token_num));
+    });
     // The stream token history is authoritative. Advance every processor exactly
     // once before mutating speculative buffers, cache layout or published output.
     if (auto error = updateLogitProcessorStatus(new_tokens, accept_token_num); error.has_value()) {
@@ -1117,6 +1132,7 @@ void GenerateStream::update(const StreamUpdateInfo& update_info) {
         return;
     }
 
+    const int pr1579_seq_len_before = seqLength();
     const auto& new_tokens     = update_info.new_tokens;
     auto        num_new_tokens = update_info.num_new_tokens;
 
@@ -1137,6 +1153,19 @@ void GenerateStream::update(const StreamUpdateInfo& update_info) {
         return;
     }
 
+    pr1579_stage2::capture("commit", [&](pybind11::dict& f) {
+        const int committed_count = seqLength() - pr1579_seq_len_before;
+        f["role"] = "target";
+        f["stream_id"] = static_cast<int64_t>(streamId());
+        f["seq_len_before"] = static_cast<int64_t>(pr1579_seq_len_before);
+        f["seq_len_after"] = static_cast<int64_t>(seqLength());
+        f["requested_num_new_tokens"] = static_cast<int64_t>(num_new_tokens);
+        f["accepted_draft_tokens"] = static_cast<int64_t>(0);
+        f["propose_step"] = static_cast<int64_t>(0);
+        f["history_commit_only"] = true;
+        pr1579_stage2::tensor(f, "committed_tokens",
+                             new_tokens.narrow(new_tokens.dim() - 1, 0, committed_count));
+    });
     resizeSubGenerateStatus(update_info.new_tokens.size(0));
 
     // Update processor state before publishing output, including the batch that

@@ -1,3 +1,4 @@
+#include "rtp_llm/cpp/models/Pr1579Stage2Diagnostic.h"
 #include "rtp_llm/cpp/models/PyWrappedModel.h"
 #include "rtp_llm/cpp/cache/KVCacheManager.h"
 #include "rtp_llm/models_py/bindings/core/ExecOps.h"
@@ -1085,6 +1086,30 @@ GptModelOutputs PyWrappedModel::forwardPostLayers(torch::Tensor         hidden,
         if (check_nan_) {
             RTP_LLM_CHECK_WITH_INFO(!torch::isnan(last_hidden).any().item<bool>(), "NAN detected in last_hidden");
             RTP_LLM_CHECK_WITH_INFO(!torch::isnan(logits).any().item<bool>(), "NAN detected in logits");
+        }
+        if (model_id_ == 0 && !inputs.warmup && !inputs.is_fake_stream) {
+            pr1579_stage2::capture("head", [&](pybind11::dict& f) {
+                f["role"] = "target";
+                f["model_id"] = static_cast<int64_t>(model_id_);
+                f["tp_rank"] = static_cast<int64_t>(device_props_.tp_rank);
+                f["tp_size"] = static_cast<int64_t>(device_props_.tp_size);
+                f["vocab_size"] = static_cast<int64_t>(description_.vocab_size);
+                f["output_vocab_size"] = static_cast<int64_t>(description_.output_vocab_size);
+                f["output_vocab_padded_size"] = static_cast<int64_t>(description_.output_vocab_padded_size);
+                f["need_all_logits"] = need_all_logits;
+                f["has_context_request"] = has_context_request;
+                f["skip_final_layernorm"] = skip_final_layernorm;
+                f["is_target_verify"] = inputs.is_target_verify;
+                pr1579_stage2::tensor(f, "hidden", last_hidden);
+                pr1579_stage2::tensor(f, "logits", logits);
+                pr1579_stage2::tensor(f, "lm_output_indexes", lm_output_indexes);
+                pr1579_stage2::tensor(f, "input_token_ids", inputs.combo_tokens);
+                pr1579_stage2::tensor(f, "position_ids", inputs.combo_position_ids);
+                pr1579_stage2::tensor(f, "input_lengths", inputs.input_lengths);
+                pr1579_stage2::tensor(f, "sequence_lengths", inputs.sequence_lengths);
+                pr1579_stage2::tensor(f, "prefix_lengths", inputs.prefix_lengths);
+                pr1579_stage2::tensor(f, "kernel_block_ids", inputs.kv_cache_kernel_block_id);
+            });
         }
         torch::Tensor softmax_result_t;
         if (need_all_logits) {
