@@ -179,6 +179,8 @@ smoke_test(
 
 custom_smoke_test(
     name = "deepseek_v41_flash_ced_dspark_pd_cp2_dp2_sm100_arm",
+    # The contract allows 3600s for startup, followed by its request checks.
+    test_envs = {"RTP_TEST_WATCHDOG_SECONDS": "6600"},
     main = "deepseek_v41_full_contract_test.py",
     smoke_args = "--tp_size 2 --ep_size 2 --dp_size 1 --world_size 4 --act_type BF16 --fp8_kv_cache 1 --seq_size_per_block 256 --kernel_seq_size_per_block 128 --max_seq_len 4096 --max_context_batch_size 1 --concurrency_limit 4 --reuse_cache 1 --load_method fastsafetensors --reserver_runtime_mem_mb 24576 --cache_store_rdma_mode 0 --use_local 1 --load_cache_timeout_ms 120000 --prefill_cp_kv_cache_sharded 1 --prefill_cp_size 2 --sp_type dspark --sp_model_type deepseek_v41_dspark --sp_act_type BF16 --gen_num_per_cycle 3",
     gpu_type = ["SM100_ARM_CU13"],
