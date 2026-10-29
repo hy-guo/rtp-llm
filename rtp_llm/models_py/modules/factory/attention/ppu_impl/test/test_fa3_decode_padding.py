@@ -384,5 +384,69 @@ class TestRaggedParamsBufferContract(unittest.TestCase):
         self.assertTrue(any(page != self.RESERVED_BLOCK for page in page_indice[-3:]))
 
 
+
+
+class RealFA3TailDiagnostic(unittest.TestCase):
+    def test_valid_attention_ignores_unused_cache_and_empty_splits(self):
+        import json
+        import os
+        from pathlib import Path
+
+        from rtp_llm.models_py.modules.factory.attention.ppu_impl.fa3_mha import (
+            _import_fa3_interface,
+        )
+
+        self.assertTrue(torch.cuda.is_available(), "PPU CUDA-compatible runtime required")
+        fa3 = _import_fa3_interface()
+        q = torch.ones((1, 7, 64), device="cuda", dtype=torch.float16)
+        table = torch.zeros((1, 1024), device="cuda", dtype=torch.int32)
+        table[0, :2] = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
+        cu = torch.arange(2, device="cuda", dtype=torch.int32)
+        results = []
+        for length in (7, 8, 9, 13, 15, 16):
+            lens = torch.tensor([length], device="cuda", dtype=torch.int32)
+            for poison in (False, True):
+                cache = torch.full(
+                    (32, 2, 1, 8, 64), float("nan") if poison else 0.0,
+                    device="cuda", dtype=torch.float16,
+                )
+                for logical in range(length):
+                    page = 1 + logical // 8
+                    cache[page, 0, 0, logical % 8].zero_()
+                    cache[page, 1, 0, logical % 8].fill_(1)
+                k, v = cache[:, 0].transpose(1, 2), cache[:, 1].transpose(1, 2)
+                for maximum in (16, 8192):
+                    for splits in (0, 1):
+                        for meta_dtype in (torch.bfloat16, torch.float16):
+                            metadata = fa3.get_scheduler_metadata(
+                                batch_size=1, max_seqlen_q=1, max_seqlen_k=maximum,
+                                num_heads_q=7, num_heads_kv=1, headdim=64,
+                                cache_seqlens=lens, qkv_dtype=meta_dtype,
+                                cu_seqlens_q=cu, page_size=8, causal=True,
+                                num_splits=splits,
+                            )
+                            out = fa3.flash_attn_with_kvcache(
+                                q=q, k_cache=k, v_cache=v, cache_seqlens=lens,
+                                page_table=table, cu_seqlens_q=cu,
+                                softmax_scale=1 / 8, causal=True,
+                                max_seqlen_q=1, max_seqlen_k=maximum,
+                                scheduler_metadata=metadata, num_splits=splits,
+                            )
+                            # Standalone op exit: read back only after the operation.
+                            value = out.float().cpu()
+                            finite = bool(torch.isfinite(value).all())
+                            maximum_error = float((value - 1).abs().max()) if finite else None
+                            results.append({
+                                "length": length, "poison_unused": poison,
+                                "max_seqlen_k": maximum, "num_splits": splits,
+                                "metadata_dtype": str(meta_dtype), "finite": finite,
+                                "maximum_error": maximum_error,
+                            })
+        output = Path(os.environ["TEST_UNDECLARED_OUTPUTS_DIR"])
+        (output / "fa3-tail-diagnostic.json").write_text(json.dumps(results, indent=2))
+        failures = [x for x in results if not x["finite"] or x["maximum_error"] > 0.002]
+        self.assertFalse(failures, json.dumps(failures))
+
+
 if __name__ == "__main__":
     unittest.main()
