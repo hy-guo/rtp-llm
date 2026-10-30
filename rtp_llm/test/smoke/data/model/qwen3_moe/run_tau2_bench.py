@@ -368,6 +368,31 @@ def main() -> None:
         },
     )
 
+    # Diagnostic branch only: observe unchanged simulator steps and thread stacks.
+    import faulthandler
+    import hashlib
+    import inspect
+    from tau2.orchestrator.orchestrator import Orchestrator
+
+    faulthandler.dump_traceback_later(300, repeat=True)
+    original_step = Orchestrator.step
+    print("[TAU2_TRACE] orchestrator_source_sha256=" + hashlib.sha256(
+        inspect.getsource(Orchestrator).encode()).hexdigest(), flush=True)
+
+    def trace_step(self):
+        started = time.monotonic()
+        label = (f"domain={self.domain} task={self.task.id} "
+                 f"step={self.step_count}/{self.max_steps} "
+                 f"from={self.from_role} to={self.to_role}")
+        print(f"[TAU2_TRACE] begin {label}", flush=True)
+        try:
+            return original_step(self)
+        finally:
+            print(f"[TAU2_TRACE] end {label} elapsed={time.monotonic()-started:.3f}s "
+                  f"next_step={self.step_count} done={self.done}", flush=True)
+
+    Orchestrator.step = trace_step
+
     print("=== Launch ===")
     result = run_task(task_cfg)
     print("\n=== Done ===")
