@@ -146,6 +146,64 @@ class MagaServerManager(object):
             self.print_process_log()
         return result
 
+    def _diagnose_checkpoint(self, model_path):
+        if not model_path or not os.path.isabs(model_path):
+            return
+        started = time.monotonic()
+        report = {"path": model_path, "pid": os.getpid(), "files": [], "errors": []}
+        names = {"config.json"}
+        index_path = os.path.join(model_path, "model.safetensors.index.json")
+        try:
+            with open(index_path) as stream:
+                index = json.load(stream)
+            names.add("model.safetensors.index.json")
+            names.update(index["weight_map"].values())
+        except FileNotFoundError:
+            try:
+                names.update(
+                    name
+                    for name in os.listdir(model_path)
+                    if name.endswith(".safetensors")
+                )
+            except OSError as exc:
+                report["errors"].append({"path": model_path, "error": repr(exc)})
+        except (OSError, ValueError, KeyError) as exc:
+            report["errors"].append({"path": index_path, "error": repr(exc)})
+        for name in sorted(names):
+            path = os.path.join(model_path, name)
+            if not os.path.realpath(path).startswith(
+                os.path.realpath(model_path) + os.sep
+            ):
+                report["errors"].append({"path": path, "error": "outside checkpoint"})
+                continue
+            try:
+                with open(path, "rb") as stream:
+                    size = os.fstat(stream.fileno()).st_size
+                    head = os.pread(stream.fileno(), min(size, 8), 0)
+                    tail = os.pread(stream.fileno(), 1, size - 1) if size else b""
+                if len(head) != min(size, 8) or len(tail) != min(size, 1):
+                    raise OSError("short read of checkpoint file")
+                report["files"].append({"name": name, "size": size})
+            except OSError as exc:
+                report["errors"].append({"path": path, "error": repr(exc)})
+                logging.error("CHECKPOINT_READ_ERROR path=%s error=%r", path, exc)
+        report["seconds"] = time.monotonic() - started
+        output = os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR", os.getcwd())
+        try:
+            with open(
+                os.path.join(output, self._role_name + "_checkpoint_read.json"), "w"
+            ) as stream:
+                json.dump(report, stream, indent=2)
+        except OSError:
+            logging.exception("Could not write checkpoint diagnostics")
+        logging.warning(
+            "CHECKPOINT_READ_SUMMARY path=%s files=%s errors=%s seconds=%.3f",
+            model_path,
+            len(report["files"]),
+            len(report["errors"]),
+            report["seconds"],
+        )
+
     def start_server(
         self,
         model_path: Optional[str] = None,
@@ -162,6 +220,9 @@ class MagaServerManager(object):
             model_type = os.environ.get("MODEL_TYPE")
         if tokenizer_path is None:
             tokenizer_path = os.environ.get("TOKENIZER_PATH", model_path)
+
+        if os.environ.get("RTP_STARTUP_DIAGNOSTICS") == "1":
+            self._diagnose_checkpoint(model_path)
 
         role_log_name = self._role_name + "_logs"
         current_env: Dict[str, str] = os.environ.copy()

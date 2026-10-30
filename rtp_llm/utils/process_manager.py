@@ -1,9 +1,11 @@
+import json
 import logging
 import os
 import signal
 import threading
 import time
 from multiprocessing import Process
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
 from rtp_llm.utils.shutdown_config import (
@@ -98,7 +100,83 @@ class ProcessManager:
         self.health_check_status: Dict[str, dict] = {}  # process_name -> status
         self.health_check_lock = threading.Lock()
 
+        self._reported_dead_processes = set()
+        self._log_startup_memory("manager_created")
+
         self._setup_signal_handlers()
+
+    def _log_startup_memory(self, phase: str):
+        if os.environ.get("RTP_STARTUP_DIAGNOSTICS") != "1":
+            return
+        roots = {Path("/sys/fs/cgroup"), Path("/sys/fs/cgroup/memory")}
+        try:
+            membership = Path("/proc/self/cgroup").read_text()
+            for row in membership.splitlines():
+                _, controllers, group = row.split(":", 2)
+                if not controllers or "memory" in controllers.split(","):
+                    root = Path(
+                        "/sys/fs/cgroup/memory" if controllers else "/sys/fs/cgroup"
+                    )
+                    candidate = root / group.lstrip("/")
+                    if ".." not in candidate.parts:
+                        roots.add(candidate)
+        except OSError as exc:
+            membership = str(exc)
+        counters = {}
+        for root in sorted(roots):
+            for name in (
+                "memory.current",
+                "memory.max",
+                "memory.peak",
+                "memory.events",
+                "memory.events.local",
+                "memory.usage_in_bytes",
+                "memory.limit_in_bytes",
+                "memory.max_usage_in_bytes",
+                "memory.failcnt",
+                "memory.oom_control",
+            ):
+                path = root / name
+                try:
+                    with path.open() as stream:
+                        counters[str(path)] = stream.read(4096).strip()
+                except OSError:
+                    pass
+        logging.warning(
+            "STARTUP_MEMORY %s",
+            json.dumps(
+                {
+                    "phase": phase,
+                    "pid": os.getpid(),
+                    "membership": membership,
+                    "counters": counters,
+                },
+                sort_keys=True,
+            ),
+        )
+
+    def _log_dead_processes(self):
+        for proc in self.processes:
+            if proc.is_alive() or proc.pid in self._reported_dead_processes:
+                continue
+            self._reported_dead_processes.add(proc.pid)
+            code = proc.exitcode
+            try:
+                reason = (
+                    signal.Signals(-code).name
+                    if isinstance(code, int) and code < 0
+                    else str(code)
+                )
+            except ValueError:
+                reason = str(code)
+            logging.error(
+                "Managed child exited before readiness: name=%s pid=%s exitcode=%s reason=%s",
+                proc.name,
+                proc.pid,
+                code,
+                reason,
+            )
+            self._log_startup_memory("child_exited")
 
     def _setup_signal_handlers(self):
         """Setup signal handlers for graceful shutdown"""
@@ -700,6 +778,7 @@ class ProcessManager:
         if self.shutdown_requested:
             return False
         if self.processes and not self._is_all_processes_alive():
+            self._log_dead_processes()
             return False
         return True
 
