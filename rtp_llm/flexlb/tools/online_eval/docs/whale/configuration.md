@@ -164,6 +164,9 @@ P/D 的 `per_engine` 模式不负责启动 Master 或 ViT。每个 ViT Pod 通�
 `CHECKPOINT_PATH` 或 `TOKENIZER_PATH`。`START_PORT` 是 HTTP 健康口，
 gRPC 是其加一；ViT 并发由 `VIT_MAX_CONCURRENT_REQUESTS` 控制，
 缓存预算由 `MOCK_VIT_CACHE_BYTES` 控制。该入口不加载 Torch，也不生成模型 metadata。
+ViT forward 的绝对超时预算包含排队时间，过期的排队任务不再下载或计算。
+同图共享任务保留仍有效的消费者预算；单个等待者取消不会取消其他消费者。
+这保留真实 `MMWorkItem.remaining_timeout_s()` 的预算语义，CPU 队列及并发上限仍为 Mock 专属限制。
 
 独立 Master 使用包含真实 VipServer adapter/client 的 JAR。CI 配方支持时，
 构建参数 `master_vipserver=true` 打包并证明该能力；运行入口为

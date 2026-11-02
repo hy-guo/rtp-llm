@@ -43,7 +43,21 @@ public final class MockVitService extends MultimodalRpcServiceGrpc.MultimodalRpc
     private final MockV41Image.Config v41;
     final String instance = UUID.randomUUID().toString();
     private final ThreadPoolExecutor executor;
-    private final Map<String, CompletableFuture<MockVitImage.Result>> pending = new ConcurrentHashMap<>();
+    private final Map<String, Work> pending = new ConcurrentHashMap<>();
+    @FunctionalInterface interface Forward {
+        MockVitImage.Result compute(long remainingMs) throws Exception;
+    }
+    private static final class Work {
+        final CompletableFuture<MockVitImage.Result> result = new CompletableFuture<>();
+        final AtomicLong deadline;
+        Work(long deadline) { this.deadline = new AtomicLong(deadline); }
+        long remainingMs() {
+            long nanos = deadline.get() - System.nanoTime();
+            if (nanos <= 0) throw Status.DEADLINE_EXCEEDED
+                    .withDescription("Mock ViT budget exhausted in forward queue").asRuntimeException();
+            return Math.max(1, TimeUnit.NANOSECONDS.toMillis(nanos));
+        }
+    }
     private final LinkedHashMap<String, MockVitImage.Result> embeddings = new LinkedHashMap<>(16, .75f, true);
     private final LinkedHashMap<String, HashEntry> hashes = new LinkedHashMap<>(16, .75f, true);
     private long embeddingBytes, hashBytes;
@@ -95,13 +109,12 @@ public final class MockVitService extends MultimodalRpcServiceGrpc.MultimodalRpc
     }
 
     CompletableFuture<MockVitImage.Result> acquire(EngineRpcService.MultimodalInputPB image, long timeoutMs) {
-        return acquire(MockVitImage.key(image), timeoutMs, () -> v41 == null
-                ? MockVitImage.compute(image, config.hiddenSize(), config.maxInputBytes(), config.maxOutputBytes(), timeoutMs)
-                : MockV41Image.compute(image, v41, config.maxInputBytes(), config.maxOutputBytes(), timeoutMs));
+        return acquire(MockVitImage.key(image), timeoutMs, remaining -> v41 == null
+                ? MockVitImage.compute(image, config.hiddenSize(), config.maxInputBytes(), config.maxOutputBytes(), remaining)
+                : MockV41Image.compute(image, v41, config.maxInputBytes(), config.maxOutputBytes(), remaining));
     }
 
-    private CompletableFuture<MockVitImage.Result> acquire(String key, long timeoutMs,
-            java.util.concurrent.Callable<MockVitImage.Result> forward) {
+    CompletableFuture<MockVitImage.Result> acquire(String key, long timeoutMs, Forward forward) {
         if (closed) return CompletableFuture.failedFuture(Status.UNAVAILABLE.asRuntimeException());
         if (timeoutMs <= 0) return CompletableFuture.failedFuture(Status.DEADLINE_EXCEEDED.asRuntimeException());
         var result = cached(key);
@@ -109,25 +122,34 @@ public final class MockVitService extends MultimodalRpcServiceGrpc.MultimodalRpc
             if (hash(key) == null) remember(key, result);
             return CompletableFuture.completedFuture(result);
         }
-        var created = new CompletableFuture<MockVitImage.Result>();
+        long deadline = System.nanoTime() + Math.min(TimeUnit.MILLISECONDS.toNanos(timeoutMs), Long.MAX_VALUE / 2);
+        var created = new Work(deadline);
         var existing = pending.putIfAbsent(key, created);
-        if (existing != null) return existing;
+        if (existing != null) {
+            // A short-lived waiter must not expire shared work needed by a live
+            // caller. Waiter cancellation still affects only respond(), not Work.
+            existing.deadline.accumulateAndGet(deadline, Math::max);
+            return existing.result;
+        }
         try {
             executor.execute(() -> {
                 try {
+                    // Like MMWorkItem.remaining_timeout_s(), queue residence is
+                    // part of the absolute producer budget, not a fresh I/O budget.
+                    created.remainingMs();
                     var resident = cached(key);
-                    if (resident != null) { created.complete(resident); return; }
+                    if (resident != null) { created.result.complete(resident); return; }
                     if (config.computeDelayMs() > 0) Thread.sleep(config.computeDelayMs());
-                    var computed = forward.call();
-                    computations.incrementAndGet(); remember(key, computed); created.complete(computed);
-                } catch (Throwable error) { created.completeExceptionally(error); }
+                    var computed = forward.compute(created.remainingMs());
+                    computations.incrementAndGet(); remember(key, computed); created.result.complete(computed);
+                } catch (Throwable error) { created.result.completeExceptionally(error); }
                 finally { pending.remove(key, created); }
             });
         } catch (RejectedExecutionException error) {
-            pending.remove(key, created); created.completeExceptionally(Status.RESOURCE_EXHAUSTED
+            pending.remove(key, created); created.result.completeExceptionally(Status.RESOURCE_EXHAUSTED
                     .withDescription("Mock ViT forward queue is full").asRuntimeException());
         }
-        return created;
+        return created.result;
     }
 
     static long timeout(Context context, long requested) {
@@ -177,7 +199,7 @@ public final class MockVitService extends MultimodalRpcServiceGrpc.MultimodalRpc
         if (inputs.hasV41Inputs()) {
             var work = MockV41Image.validate(inputs, v41, config.maxInputBytes());
             values = work.stream().map(item -> acquire(item.key(), budget,
-                    () -> MockV41Image.compute(item.image(), v41, config.maxOutputBytes()))).toList();
+                    remaining -> MockV41Image.compute(item.image(), v41, config.maxOutputBytes()))).toList();
         } else {
             validate(inputs);
             values = inputs.getMultimodalInputsList().stream().map(image -> acquire(image, budget)).toList();
@@ -304,7 +326,7 @@ public final class MockVitService extends MultimodalRpcServiceGrpc.MultimodalRpc
     @Override public void close() {
         closed = true;
         executor.shutdownNow();
-        pending.values().forEach(value -> value.completeExceptionally(Status.UNAVAILABLE.asRuntimeException())); pending.clear();
+        pending.values().forEach(value -> value.result.completeExceptionally(Status.UNAVAILABLE.asRuntimeException())); pending.clear();
         synchronized (this) { embeddings.clear(); hashes.clear(); embeddingBytes = hashBytes = 0; }
     }
 }

@@ -121,6 +121,70 @@ class MockVitServiceTest {
         assertEquals(64, surviving.get(5, TimeUnit.SECONDS).getSplitSize(0));
         assertEquals(1, service.computations.get());
     }
+    @Test void expiredQueuedProducerDoesNotRunOrPopulateCaches() throws Exception {
+        var d = MockVitService.Config.defaults();
+        service = new MockVitService(new MockVitService.Config(8, 1, 4, 1 << 20, 1 << 20,
+                d.maxInputBytes(), d.maxOutputBytes(), 0));
+        var result = MockVitImage.compute(image(28, 28, 0xabcdef), 8, 1 << 20, 1 << 20, 1000);
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        var first = service.acquire("first", 5000, remaining -> {
+            entered.countDown();
+            assertTrue(release.await(5, TimeUnit.SECONDS));
+            return result;
+        });
+        assertTrue(entered.await(5, TimeUnit.SECONDS));
+        var calls = new java.util.concurrent.atomic.AtomicInteger();
+        var expired = service.acquire("expired", 20, remaining -> { calls.incrementAndGet(); return result; });
+        try {
+            assertFalse(expired.isDone());
+            TimeUnit.MILLISECONDS.sleep(50);
+        } finally { release.countDown(); }
+        assertSame(result, first.get(5, TimeUnit.SECONDS));
+        var error = assertThrows(java.util.concurrent.ExecutionException.class,
+                () -> expired.get(5, TimeUnit.SECONDS));
+        assertEquals(Status.Code.DEADLINE_EXCEEDED, Status.fromThrowable(error.getCause()).getCode());
+        assertEquals(0, calls.get(), "expired queued work must not download or compute");
+        assertEquals(1, service.computations.get());
+    }
+    @Test void queueResidenceIsSubtractedFromForwardIoBudget() throws Exception {
+        var d = MockVitService.Config.defaults();
+        service = new MockVitService(new MockVitService.Config(8, 1, 4, 0, 0,
+                d.maxInputBytes(), d.maxOutputBytes(), 0));
+        var result = MockVitImage.compute(image(28, 28, 0xabcdef), 8, 1 << 20, 1 << 20, 1000);
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        service.acquire("first", 5000, remaining -> {
+            entered.countDown(); assertTrue(release.await(5, TimeUnit.SECONDS)); return result;
+        });
+        assertTrue(entered.await(5, TimeUnit.SECONDS));
+        var observed = new java.util.concurrent.atomic.AtomicLong();
+        var queued = service.acquire("queued", 5000, remaining -> { observed.set(remaining); return result; });
+        try { TimeUnit.MILLISECONDS.sleep(30); } finally { release.countDown(); }
+        assertSame(result, queued.get(5, TimeUnit.SECONDS));
+        assertTrue(observed.get() > 0 && observed.get() < 5000,
+                "forward I/O must receive the remaining budget, not the original timeout");
+    }
+    @Test void liveSharedConsumerKeepsQueuedProducerAliveAfterFirstWaiterBudget() throws Exception {
+        var d = MockVitService.Config.defaults();
+        service = new MockVitService(new MockVitService.Config(8, 1, 4, 0, 0,
+                d.maxInputBytes(), d.maxOutputBytes(), 0));
+        var result = MockVitImage.compute(image(28, 28, 0xabcdef), 8, 1 << 20, 1 << 20, 1000);
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        service.acquire("first", 5000, remaining -> {
+            entered.countDown(); assertTrue(release.await(5, TimeUnit.SECONDS)); return result;
+        });
+        assertTrue(entered.await(5, TimeUnit.SECONDS));
+        var shortWaiter = service.acquire("shared", 20, remaining -> result);
+        var liveWaiter = service.acquire("shared", 5000, remaining -> {
+            fail("same image must retain the original shared producer"); return result;
+        });
+        assertSame(shortWaiter, liveWaiter);
+        try { TimeUnit.MILLISECONDS.sleep(50); } finally { release.countDown(); }
+        assertSame(result, liveWaiter.get(5, TimeUnit.SECONDS));
+        assertEquals(2, service.computations.get());
+    }
     @Test void prefillConsumesFeaturesAndRejectsWrongFrontendHashes() throws Exception {
         start(MockVitService.Config.defaults());
         var image = image(224, 224, 0xabcdef);
