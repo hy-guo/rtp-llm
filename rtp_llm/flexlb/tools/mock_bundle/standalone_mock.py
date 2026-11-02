@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shlex
 import socket
+import sys
 
 from deployment import resolve
 
@@ -99,6 +100,7 @@ def command(env):
     java = str(Path(env.get("JAVA_HOME", "/opt/taobao/java")) / "bin/java")
     jar = Path(env.get("MOCK_BUNDLE_JAR_DIR", str(ROOT / "jars"))) / "mock.jar"
     args = [java, *shlex.split(env.get("MOCK_JAVA_OPTS", "-Xms512m -Xmx2g")),
+            "-Dmock.vit.imagePython=" + sys.executable,
             "-jar", str(jar), "--whale", "true", "--whale-bundle", str(not remote_decode).lower(),
             "--kmonitor", str(kmonitor).lower(), "--host", host,
             "--unique-engine-ips", "false", "--auto-fetch", str(not fetch).lower(),

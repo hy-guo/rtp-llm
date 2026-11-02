@@ -28,6 +28,28 @@ class KvcmEventPublisherTest {
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final String OK = "{\"header\":{\"status\":{\"code\":\"OK\"}}}";
 
+    @Test void vipDiscoveryMissingDependencyFailsBeforePublisherStarts() throws Exception {
+        var config = KvcmEventPublisher.Config.fromEnv(Map.of(
+                "KV_CACHE_EVENT_PUBLISHER_TYPE", "kvcm", "KV_CACHE_EVENT_INSTANCE_GROUP", "test-group",
+                "KV_CACHE_EVENT_INSTANCE_ID", "test-deployment", "RECO_ENABLE_VIPSERVER", "1",
+                "RECO_VIPSERVER_DOMAIN", "test-domain"));
+        boolean packaged;
+        try {
+            Class.forName("com.taobao.vipserver.client.core.VIPClient", false, getClass().getClassLoader());
+            packaged = true;
+        } catch (ClassNotFoundException error) { packaged = false; }
+        if (packaged) {
+            try (var resolver = new KvcmEndpointResolver(config, "test-deployment")) {
+                assertNotNull(resolver);
+            }
+        } else {
+            var failure = assertThrows(IllegalStateException.class,
+                    () -> new KvcmEndpointResolver(config, "test-deployment"));
+            assertInstanceOf(ClassNotFoundException.class, failure.getCause());
+            assertTrue(failure.getMessage().contains("whale-kvcm-discovery"));
+        }
+    }
+
     private static KvcmEventPublisher.Config config(URI endpoint, int capacity) {
         return new KvcmEventPublisher.Config(
                         endpoint,

@@ -16,9 +16,17 @@ import java.security.MessageDigest;
 import java.time.Duration;
 import java.util.Base64;
 import java.util.Locale;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /** Qwen2/2.5-VL image geometry; forward values are deterministic CPU simulation. */
 final class MockVitImage {
+    private static final ScheduledThreadPoolExecutor DOWNLOAD_TIMER = new ScheduledThreadPoolExecutor(1, task -> {
+        Thread thread = new Thread(task, "mock-vit-download-deadline"); thread.setDaemon(true); return thread;
+    });
+    static { DOWNLOAD_TIMER.setRemoveOnCancelPolicy(true); }
     record Result(EngineRpcService.TensorPB embedding, EngineRpcService.TensorPB hashes, int rows) {
         long embeddingBytes() { return embedding.getFp32Data().size() + embedding.getBf16Data().size(); }
         long hashBytes() { return hashes.getInt32Data().size(); }
@@ -63,6 +71,7 @@ final class MockVitImage {
 
     static BufferedImage decode(EngineRpcService.MultimodalInputPB input, int maxInputBytes,
                                 long timeoutMs) throws Exception {
+        long started = System.nanoTime();
         if (input.getMultimodalType() != 1) throw new IllegalArgumentException("Mock ViT currently supports IMAGE only");
         if (input.getMultimodalTensor().getSerializedSize() != 0)
             throw new IllegalArgumentException("Mock ViT requires URL images, not preprocessed tensors");
@@ -85,14 +94,30 @@ final class MockVitImage {
                     HttpResponse.BodyHandlers.ofInputStream());
             try (var body = response.body()) {
                 if (response.statusCode() / 100 != 2) throw new IllegalArgumentException("image download HTTP " + response.statusCode());
-                raw = body.readNBytes(maxInputBytes + 1);
+                long remaining = timeoutMs - TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+                if (remaining <= 0) throw new TimeoutException("Image download deadline expired");
+                var expired = new AtomicBoolean();
+                // HttpRequest.timeout ends at headers with ofInputStream. Bound the
+                // body as well, like the real loader's deadline-aware read loop.
+                var alarm = DOWNLOAD_TIMER.schedule(() -> {
+                    expired.set(true);
+                    try { body.close(); } catch (java.io.IOException ignored) { }
+                }, remaining, TimeUnit.MILLISECONDS);
+                try {
+                    raw = body.readNBytes(maxInputBytes + 1);
+                    if (expired.get()) throw new TimeoutException("Image download deadline expired");
+                } catch (java.io.IOException error) {
+                    if (expired.get()) throw new TimeoutException("Image download deadline expired");
+                    throw error;
+                } finally { alarm.cancel(false); }
             }
         }
         if (raw.length > maxInputBytes) throw new IllegalArgumentException("image exceeds byte limit");
         BufferedImage image;
         try (var stream = ImageIO.createImageInputStream(new ByteArrayInputStream(raw))) {
             var readers = ImageIO.getImageReaders(stream);
-            if (!readers.hasNext()) throw new IllegalArgumentException("unsupported or invalid image");
+            if (!readers.hasNext()) return MockVitPillowDecoder.decode(raw,
+                    timeoutMs - java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
             var reader = readers.next();
             try {
                 reader.setInput(stream, true, true);

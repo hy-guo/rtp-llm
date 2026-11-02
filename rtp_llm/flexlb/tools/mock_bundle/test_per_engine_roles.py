@@ -18,6 +18,7 @@ class PerEngineRolesTest(unittest.TestCase):
         with patch.object(vit, "prepare_assets", return_value=Path("/model")) as prepare:
             args = vit.command(env)
         prepare.assert_called_once()
+        self.assertIn("-Dmock.vit.imagePython=" + sys.executable, args)
         for key, value in (("--http-port", "22160"), ("--port", "22161"),
                            ("--model-path", "/model"), ("--concurrency", "3"),
                            ("--queue-capacity", "2048"), ("--max-input-bytes", str(512 << 20)),

@@ -29,6 +29,13 @@ final class KvcmEndpointResolver implements AutoCloseable {
 
     KvcmEndpointResolver(KvcmEventPublisher.Config config, String instance) {
         this(config, instance, () -> addresses(config.discovery()), KvcmEndpointResolver::queryLeader);
+        if (config.endpoint() == null && config.discovery().vipserver()) {
+            try {
+                Class.forName("com.taobao.vipserver.client.core.VIPClient", false, getClass().getClassLoader());
+            } catch (ClassNotFoundException error) {
+                throw new IllegalStateException("VIPServer discovery requires a Mock JAR built with whale-kvcm-discovery", error);
+            }
+        }
     }
     KvcmEndpointResolver(KvcmEventPublisher.Config config, String instance, Addresses addresses, ClusterInfo clusterInfo) {
         this.config = config; this.instance = instance; this.addresses = addresses; this.clusterInfo = clusterInfo;

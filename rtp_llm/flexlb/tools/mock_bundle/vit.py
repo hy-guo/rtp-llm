@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import shlex
+import sys
 
 from whale_frontend_fixture import prepare_assets
 
@@ -22,7 +23,8 @@ def command(env):
     java = str(Path(env.get("JAVA_HOME", "/opt/taobao/java")) / "bin/java")
     jar = Path(env.get("MOCK_BUNDLE_JAR_DIR", str(Path(__file__).parent / "jars"))) / "mock.jar"
     return [java, *shlex.split(env.get("MOCK_VIT_JAVA_OPTS", "-Xms64m -Xmx512m")),
-            "-Djava.awt.headless=true", "-cp", str(jar), "org.flexlb.mockengine.MockVitServer",
+            "-Djava.awt.headless=true", "-Dmock.vit.imagePython=" + sys.executable,
+            "-cp", str(jar), "org.flexlb.mockengine.MockVitServer",
             "--http-port", str(port), "--port", str(port + 1), "--model-path", str(model),
             "--concurrency", env.get("VIT_MAX_CONCURRENT_REQUESTS", "32"),
             "--queue-capacity", env.get("MOCK_VIT_QUEUE_CAPACITY", "2048"),
