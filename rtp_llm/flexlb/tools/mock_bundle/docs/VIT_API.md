@@ -71,6 +71,10 @@ python3 rtp_llm/flexlb/tools/mock_bundle/vit_frontend_smoke.py \
 P 校验 canonical token metadata/image mask 和返回行数，保留 frontend 的 canonical IDs，不用 embedding hash 覆盖它们。
 text-only V4.1 metadata 不触发 ViT RPC。
 
+P 的 inline 传输适配按输入字节和输出行数分块，最多同时处理 4 块，并按原顺序合并文本、图片及缓存身份跨度。
+所有分块共享同一多模态截止时间和调用方取消；失败或到期会取消剩余 RPC，不为每块重新延长预算。
+这是 Mock 的有界内存传输机制；real `MMRemoteOutputTransport` 使用一次 fetch，可按实际环境选择 inline 或 RDMA。
+
 模型 forward 为确定性 CPU 模拟。非空 content identity 采用 main vision encode cache 的信任语义；空 identity 不命中或填充缓存。
 KV key 使用 main C++ 的长度前缀字节身份及模型 namespace：默认 full `0x4453563431494631`，
 `DSV41_SWA_BOUNDED_REPLAY=1` 使用 `0x4453563431494231`；可显式用 `MOCK_CACHE_KEY_HASH_SEED` 对齐其他模型 namespace。

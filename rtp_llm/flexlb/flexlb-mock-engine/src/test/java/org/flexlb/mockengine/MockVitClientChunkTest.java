@@ -165,4 +165,59 @@ class MockVitClientChunkTest {
         run(4, 16, 16, 2, false);
         run(1, 64, 64, 3, false);
     }
+
+    @org.junit.jupiter.api.Test
+    void genericChunksOverlapAndRetainTextImageOrderAndOffsets() throws Exception {
+        var started = new java.util.concurrent.CountDownLatch(4);
+        var calls = new AtomicInteger();
+        var service = new MultimodalRpcServiceGrpc.MultimodalRpcServiceImplBase() {
+            @Override public void remoteMultimodalEmbedding(EngineRpcService.MultimodalInputsPB r,
+                    StreamObserver<EngineRpcService.MultimodalOutputPB> o) {
+                int image = Integer.parseInt(r.getMultimodalInputs(0).getMultimodalUrl());
+                calls.incrementAndGet();
+                started.countDown();
+                try {
+                    check(started.await(5, java.util.concurrent.TimeUnit.SECONDS), "serial chunk RPCs");
+                    int rows = 1 + image % 3;
+                    byte[] data = new byte[rows * 4 * 2];
+                    java.util.Arrays.fill(data, (byte) image);
+                    o.onNext(EngineRpcService.MultimodalOutputPB.newBuilder().addSplitSize(rows)
+                            .setMultimodalEmbedding(EngineRpcService.TensorPB.newBuilder()
+                                    .setDataType(EngineRpcService.TensorPB.DataType.BF16)
+                                    .addShape(rows).addShape(4).setBf16Data(ByteString.copyFrom(data)))
+                            .build());
+                    o.onCompleted();
+                } catch (InterruptedException error) {
+                    Thread.currentThread().interrupt();
+                    o.onError(Status.CANCELLED.asRuntimeException());
+                }
+            }
+        };
+        var server = builder().addService(service).build().start();
+        try (var client = new MockVitClient()) {
+            client.configureV41(new MockV41Image.Config(4, 14, 1, 8192, 10000, ID, 196, 7));
+            var input = EngineRpcService.GenerateInputPB.newBuilder().setRequestId(7).addTokenIds(100);
+            input.getGenerateConfigBuilder().addRoleAddrs(EngineRpcService.RoleAddrPB.newBuilder()
+                    .setRoleStr("VIT").setIp("127.0.0.1").setGrpcPort(server.getPort()));
+            for (int i = 0; i < 9; i++) {
+                input.addTokenIds(7).addTokenIds(200 + i);
+                input.addMultimodalInputs(EngineRpcService.MultimodalInputPB.newBuilder().setMultimodalUrl("" + i));
+            }
+            var result = client.prepareRequest(input.build(), 15000);
+            var expected = new java.util.ArrayList<Integer>();
+            expected.add(100);
+            for (int i = 0; i < 9; i++) {
+                int rows = 1 + i % 3;
+                check(result.spans().get(i).getOffset() == expected.size(), "image offset/order changed");
+                check(result.spans().get(i).getRowHashesCount() == rows, "image rows changed");
+                byte[] row = new byte[8]; java.util.Arrays.fill(row, (byte) i);
+                int hash = MockFeatureHash.row(row, 0, row.length);
+                for (int value : result.spans().get(i).getRowHashesList()) check(value == hash, "image identity/order changed");
+                for (int j = 0; j < rows; j++) expected.add(7);
+                expected.add(200 + i);
+            }
+            check(result.input().getTokenIdsList().equals(expected), "text or image order changed");
+            check(calls.get() == 9, "missing or duplicate chunk RPC");
+        } finally { server.shutdownNow().awaitTermination(); }
+    }
 }

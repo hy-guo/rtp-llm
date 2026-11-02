@@ -27,6 +27,13 @@ final class MockVitImage {
         Thread thread = new Thread(task, "mock-vit-download-deadline"); thread.setDaemon(true); return thread;
     });
     static { DOWNLOAD_TIMER.setRemoveOnCancelPolicy(true); }
+    private static final HttpClient IMAGE_HTTP = httpClientBuilder().build();
+
+    static HttpClient.Builder httpClientBuilder() {
+        // The real requests-based loader follows image redirects, including
+        // HTTPS -> HTTP. Request and body deadlines still bound the whole read.
+        return HttpClient.newBuilder().followRedirects(HttpClient.Redirect.ALWAYS);
+    }
     record Result(EngineRpcService.TensorPB embedding, EngineRpcService.TensorPB hashes, int rows) {
         long embeddingBytes() { return embedding.getFp32Data().size() + embedding.getBf16Data().size(); }
         long hashBytes() { return hashes.getInt32Data().size(); }
@@ -88,9 +95,7 @@ final class MockVitImage {
             URI uri = URI.create(url);
             if (!"http".equals(uri.getScheme()) && !"https".equals(uri.getScheme()))
                 throw new IllegalArgumentException("image URL must use http, https or data");
-            var client = HttpClient.newBuilder().connectTimeout(Duration.ofMillis(timeoutMs))
-                    .followRedirects(HttpClient.Redirect.NORMAL).build();
-            var response = client.send(HttpRequest.newBuilder(uri).timeout(Duration.ofMillis(timeoutMs)).GET().build(),
+            var response = IMAGE_HTTP.send(HttpRequest.newBuilder(uri).timeout(Duration.ofMillis(timeoutMs)).GET().build(),
                     HttpResponse.BodyHandlers.ofInputStream());
             try (var body = response.body()) {
                 if (response.statusCode() / 100 != 2) throw new IllegalArgumentException("image download HTTP " + response.statusCode());

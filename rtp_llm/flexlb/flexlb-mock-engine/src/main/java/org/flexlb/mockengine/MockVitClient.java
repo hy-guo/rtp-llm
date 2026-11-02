@@ -47,29 +47,26 @@ final class MockVitClient implements AutoCloseable {
             if (input.getTokenIds(i) == v41.imageTokenId()) placeholders.add(i);
         if (placeholders.size() != count) throw Status.INVALID_ARGUMENT
                 .withDescription("image placeholder count does not match media inputs").asRuntimeException();
-        long started = System.nanoTime(), budget = Math.min(budgetMs, 120000);
         var output = input.toBuilder().clearTokenIds();
         var spans = new ArrayList<EngineRpcService.MultimodalCacheSpanPB>();
-        int cursor = 0;
-        for (int first = 0; first < count; first += perChunk) {
+        output.addAllTokenIds(input.getTokenIdsList().subList(0, placeholders.get(0)));
+        MockVitChunks.run((count + perChunk - 1) / perChunk, budgetMs, (index, remaining) -> {
+            int first = index * perChunk;
             int last = Math.min(count, first + perChunk);
-            int begin = placeholders.get(first), end = placeholders.get(last - 1) + 1;
-            output.addAllTokenIds(input.getTokenIdsList().subList(cursor, begin));
+            int begin = placeholders.get(first);
+            int end = last == count ? input.getTokenIdsCount() : placeholders.get(last);
             var chunk = input.toBuilder().clearTokenIds().clearMultimodalInputs()
                     .addAllTokenIds(input.getTokenIdsList().subList(begin, end))
                     .addAllMultimodalInputs(input.getMultimodalInputsList().subList(first, last)).build();
-            long remaining = budget - TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
-            if (remaining <= 0) throw Status.DEADLINE_EXCEEDED.asRuntimeException();
-            var prepared = prepareResponse(chunk, remaining);
+            return prepareResponse(chunk, remaining);
+        }, prepared -> {
             int offset = output.getTokenIdsCount();
             output.addAllTokenIds(prepared.input().getTokenIdsList());
             for (var span : prepared.spans())
                 spans.add(span.toBuilder().setOffset(Math.addExact(offset, span.getOffset())).build());
             if (output.getTokenIdsCount() >= v41.maxSequence()) throw Status.INVALID_ARGUMENT
                     .withDescription("expanded multimodal input exceeds model sequence limit").asRuntimeException();
-            cursor = end;
-        }
-        output.addAllTokenIds(input.getTokenIdsList().subList(cursor, input.getTokenIdsCount()));
+        });
         if (output.getTokenIdsCount() >= v41.maxSequence()) throw Status.INVALID_ARGUMENT
                 .withDescription("expanded multimodal input exceeds model sequence limit").asRuntimeException();
         return new Prepared(output.build(), spans);
@@ -84,8 +81,7 @@ final class MockVitClient implements AutoCloseable {
                 images.stream().mapToLong(EngineRpcService.V41ImageInputPB::getTypesCount).sum();
         if (input.getSerializedSize() <= CHUNK_BYTES && totalRows <= CHUNK_ROWS)
             return prepareOne(input, budgetMs);
-        long started = System.nanoTime();
-        long totalBudget = Math.min(budgetMs, 120000);
+        var ranges = new ArrayList<int[]>();
         int first = 0;
         while (first < images.size()) {
             if (Context.current().isCancelled()) throw Status.CANCELLED.asRuntimeException();
@@ -100,7 +96,12 @@ final class MockVitClient implements AutoCloseable {
                 rows += image.getTypesCount();
                 last++;
             }
-            int begin = images.get(first).getStart();
+            ranges.add(new int[] {first, last});
+            first = last;
+        }
+        MockVitChunks.run(ranges.size(), budgetMs, (index, remaining) -> {
+            int beginIndex = ranges.get(index)[0], last = ranges.get(index)[1];
+            int begin = images.get(beginIndex).getStart();
             var finalImage = images.get(last - 1);
             int end = Math.addExact(finalImage.getStart(), finalImage.getTypesCount());
             var typed =
@@ -110,7 +111,7 @@ final class MockVitClient implements AutoCloseable {
                             .clearImageMask();
             typed.addAllTokenTypes(input.getV41Inputs().getTokenTypesList().subList(begin, end));
             typed.addAllImageMask(input.getV41Inputs().getImageMaskList().subList(begin, end));
-            for (int i = first; i < last; i++)
+            for (int i = beginIndex; i < last; i++)
                 typed.addImages(
                         images.get(i).toBuilder().setStart(images.get(i).getStart() - begin));
             var chunk =
@@ -119,13 +120,9 @@ final class MockVitClient implements AutoCloseable {
                             .addAllTokenIds(input.getTokenIdsList().subList(begin, end))
                             .setV41Inputs(typed)
                             .build();
-            long remaining =
-                    totalBudget - TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
-            if (remaining <= 0) throw Status.DEADLINE_EXCEEDED.asRuntimeException();
             // The original validation and feature checks run for every bounded response.
-            prepareOne(chunk, remaining);
-            first = last;
-        }
+            return prepareOne(chunk, remaining);
+        }, ignored -> {});
         // The scheduler/cache/EOS path receives the exact original canonical input.
         return input;
     }
