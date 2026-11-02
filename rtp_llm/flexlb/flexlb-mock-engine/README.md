@@ -65,6 +65,15 @@ WorkerStatus 在移除 running 条目前先发布终态记录；running、保留
 
 单引擎关闭先停止准入、关闭调用并打断回调，验证 transport 与该引擎回调均退出后才释放端口和所有者。关闭失败保留资源归属，允许重试；线程忽略中断时不能报告关闭成功。
 
+ViT 的 Pillow fallback 解码使用进程级并发上限 `max(1, min(4, availableProcessors))`，
+等待解码进程名额也消耗请求的绝对预算；子进程退出后才归还名额。
+这是 Mock 的内存保护措施，不代表真实引擎采用相同的 worker 数。
+真实依据是 [MultiprocessPreprocessExecutor._create_pool / get_result](../../multimodal/mm_process_engine.py)
+的有界进程池及剩余 deadline 语义。
+Hash-only 和异步提交不额外保留完整响应 tensor；同步响应拼接不可变 protobuf bytes，
+保持 tensor 字节、图片顺序和重复图片分段不变。这些改动降低 Mock 的内存峰值，
+不模拟真实模型推理显存或证明其性能。
+
 协议和所有权细节统一见[请求生命周期](../tools/online_eval/docs/architecture/request-lifecycle.md)。
 
 ## Device 与 Memory cache

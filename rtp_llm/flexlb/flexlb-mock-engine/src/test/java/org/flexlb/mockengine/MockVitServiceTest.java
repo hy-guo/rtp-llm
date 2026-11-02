@@ -236,4 +236,48 @@ class MockVitServiceTest {
         assertEquals(1, service.computations.get());
     }
 
+    @Test void aggregateResponsePreservesExactTensorBytesAndInputOrder() throws Exception {
+        start(MockVitService.Config.defaults());
+        var a = image(224, 224, 0x123456);
+        var b = image(448, 224, 0x987654);
+        var first = stub.remoteMultimodalEmbedding(inputs(a));
+        var second = stub.remoteMultimodalEmbedding(inputs(b));
+        var aggregate = stub.remoteMultimodalEmbedding(inputs(b, a, b));
+        assertEquals(List.of(128, 64, 128), aggregate.getSplitSizeList());
+        assertEquals(second.getMultimodalEmbedding().getFp32Data()
+                        .concat(first.getMultimodalEmbedding().getFp32Data())
+                        .concat(second.getMultimodalEmbedding().getFp32Data()),
+                aggregate.getMultimodalEmbedding().getFp32Data());
+        assertEquals(second.getMultimodalFeatureHash().getInt32Data()
+                        .concat(first.getMultimodalFeatureHash().getInt32Data())
+                        .concat(second.getMultimodalFeatureHash().getInt32Data()),
+                aggregate.getMultimodalFeatureHash().getInt32Data());
+        // Also exercise protobuf serialization of the segmented immutable bytes.
+        assertEquals(aggregate, EngineRpcService.MultimodalOutputPB.parseFrom(aggregate.toByteArray()));
+    }
+
+    @Test void hashOnlyBatchWorksWithBothCachesDisabled() throws Exception {
+        var d = MockVitService.Config.defaults();
+        start(new MockVitService.Config(8, 1, 4, 0, 0,
+                d.maxInputBytes(), d.maxOutputBytes(), 0));
+        var a = image(224, 224, 0x123456);
+        var b = image(448, 224, 0x987654);
+        var response = stub.getMultimodalHashes(EngineRpcService.MultimodalHashRequestPB.newBuilder()
+                .addKeys(MockVitImage.key(b)).addKeys(MockVitImage.key(a))
+                .setInputs(inputs(a, b)).build());
+        assertEquals(2, response.getEntriesCount());
+        for (int i = 0; i < 2; i++) {
+            var source = i == 0 ? b : a;
+            var expected = MockVitImage.compute(source, 8, d.maxInputBytes(), d.maxOutputBytes(), 5000);
+            var entry = response.getEntries(i);
+            assertEquals(MockVitImage.key(source), entry.getKey());
+            assertTrue(entry.getHashHit());
+            assertFalse(entry.getEmbeddingHit());
+            assertEquals(List.of(expected.rows()), entry.getSplitSizeList());
+            assertEquals(expected.hashes().getInt32Data(), entry.getFeatureHashes());
+        }
+        assertEquals(0L, service.snapshot().get("embedding_bytes"));
+        assertEquals(0L, service.snapshot().get("hash_bytes"));
+    }
+
 }

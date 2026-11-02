@@ -7,7 +7,6 @@ import io.grpc.stub.StreamObserver;
 import org.flexlb.engine.grpc.EngineRpcService;
 import org.flexlb.engine.grpc.MultimodalRpcServiceGrpc;
 
-import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -194,7 +193,8 @@ public final class MockVitService extends MultimodalRpcServiceGrpc.MultimodalRpc
             if (input.getMultimodalUrl().isBlank() || input.getMultimodalType() != 1)
                 throw new IllegalArgumentException("Mock ViT accepts URL IMAGE inputs only");
     }
-    private CompletableFuture<List<MockVitImage.Result>> acquireAll(EngineRpcService.MultimodalInputsPB inputs, long budget) {
+    private List<CompletableFuture<MockVitImage.Result>> submitAll(
+            EngineRpcService.MultimodalInputsPB inputs, long budget) {
         List<CompletableFuture<MockVitImage.Result>> values;
         if (inputs.hasV41Inputs()) {
             var work = MockV41Image.validate(inputs, v41, config.maxInputBytes());
@@ -204,6 +204,10 @@ public final class MockVitService extends MultimodalRpcServiceGrpc.MultimodalRpc
             validate(inputs);
             values = inputs.getMultimodalInputsList().stream().map(image -> acquire(image, budget)).toList();
         }
+        return values;
+    }
+    private CompletableFuture<List<MockVitImage.Result>> acquireAll(EngineRpcService.MultimodalInputsPB inputs, long budget) {
+        var values = submitAll(inputs, budget);
         return CompletableFuture.allOf(values.toArray(CompletableFuture[]::new))
                 .thenApply(ignored -> values.stream().map(CompletableFuture::join).toList());
     }
@@ -215,25 +219,27 @@ public final class MockVitService extends MultimodalRpcServiceGrpc.MultimodalRpc
         catch (IllegalArgumentException error) { observer.onError(Status.INVALID_ARGUMENT.withDescription(error.getMessage()).asRuntimeException()); }
     }
     private EngineRpcService.MultimodalOutputPB output(List<MockVitImage.Result> results) {
-        var data = new ByteArrayOutputStream(); var ids = new ByteArrayOutputStream();
+        ByteString data = ByteString.EMPTY, ids = ByteString.EMPTY;
         var output = EngineRpcService.MultimodalOutputPB.newBuilder();
         int rows = 0;
         boolean bf16 = !results.isEmpty() && results.get(0).embedding().getDataType() == EngineRpcService.TensorPB.DataType.BF16;
         for (var result : results) {
             if ((long)data.size() + result.embeddingBytes() > config.maxOutputBytes())
                 throw new IllegalArgumentException("aggregate embedding exceeds output byte limit");
-            data.writeBytes((bf16 ? result.embedding().getBf16Data() : result.embedding().getFp32Data()).toByteArray());
-            ids.writeBytes(result.hashes().getInt32Data().toByteArray());
+            // Immutable ropes keep the same wire bytes without flattening every
+            // image and then copying the whole response another two times.
+            data = data.concat(bf16 ? result.embedding().getBf16Data() : result.embedding().getFp32Data());
+            ids = ids.concat(result.hashes().getInt32Data());
             output.addSplitSize(result.rows()); rows = Math.addExact(rows, result.rows());
         }
         var tensor = EngineRpcService.TensorPB.newBuilder().addShape(rows)
                 .addShape(bf16 ? v41.hidden() : config.hiddenSize());
-        if (bf16) tensor.setDataType(EngineRpcService.TensorPB.DataType.BF16).setBf16Data(ByteString.copyFrom(data.toByteArray()));
-        else tensor.setDataType(EngineRpcService.TensorPB.DataType.FP32).setFp32Data(ByteString.copyFrom(data.toByteArray()));
+        if (bf16) tensor.setDataType(EngineRpcService.TensorPB.DataType.BF16).setBf16Data(data);
+        else tensor.setDataType(EngineRpcService.TensorPB.DataType.FP32).setFp32Data(data);
         return output.setMultimodalEmbedding(tensor)
                 .setMultimodalFeatureHash(EngineRpcService.TensorPB.newBuilder()
                         .setDataType(EngineRpcService.TensorPB.DataType.INT32).addShape(rows)
-                        .setInt32Data(ByteString.copyFrom(ids.toByteArray()))).build();
+                        .setInt32Data(ids)).build();
     }
 
     @Override public void getMultimodalHashes(EngineRpcService.MultimodalHashRequestPB request,
@@ -243,7 +249,7 @@ public final class MockVitService extends MultimodalRpcServiceGrpc.MultimodalRpc
             if (request.getKeysCount() > 256 || request.getKeysList().stream().anyMatch(k -> k.isBlank() || k.length() > 4096))
                 throw new IllegalArgumentException("invalid multimodal cache keys");
             var keys = new LinkedHashSet<>(request.getKeysList());
-            Map<String, MockVitImage.Result> transientResults = new ConcurrentHashMap<>();
+            Map<String, HashEntry> transientResults = new ConcurrentHashMap<>();
             List<CompletableFuture<?>> work = new ArrayList<>();
             if (request.hasInputs()) {
                 validate(request.getInputs());
@@ -256,7 +262,8 @@ public final class MockVitService extends MultimodalRpcServiceGrpc.MultimodalRpc
                 for (String key : keys) if (hash(key) == null) {
                     var image = submitted.get(key);
                     if (image == null) throw new IllegalArgumentException("missing image for uncached key");
-                    work.add(acquire(image, budget).thenAccept(value -> transientResults.put(key, value)));
+                    work.add(acquire(image, budget).thenAccept(value -> transientResults.put(key,
+                            new HashEntry(value.hashes(), value.rows(), ""))));
                 }
             }
             respond(CompletableFuture.allOf(work.toArray(CompletableFuture[]::new)).thenApply(ignored -> {
@@ -280,7 +287,12 @@ public final class MockVitService extends MultimodalRpcServiceGrpc.MultimodalRpc
     @Override public void asyncSubmitEmbedding(EngineRpcService.MultimodalInputsPB inputs,
                                                StreamObserver<EngineRpcService.EmptyPB> observer) {
         try {
-            var futures = acquireAll(inputs, timeout(Context.current(), inputs.getTimeoutMs()));
+            // Async publication owns no response tensor list. Drop each result
+            // after its bounded caches have published it, rather than retaining
+            // all completed embeddings until the last image finishes.
+            var values = submitAll(inputs, timeout(Context.current(), inputs.getTimeoutMs())).stream()
+                    .map(value -> value.thenAccept(ignored -> {})).toList();
+            var futures = CompletableFuture.allOf(values.toArray(CompletableFuture[]::new));
             if (futures.isCompletedExceptionally()) futures.join();
             observer.onNext(EngineRpcService.EmptyPB.getDefaultInstance()); observer.onCompleted();
         } catch (Throwable error) {
