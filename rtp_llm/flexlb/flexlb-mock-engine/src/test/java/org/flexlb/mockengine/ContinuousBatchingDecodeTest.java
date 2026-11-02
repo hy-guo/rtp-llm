@@ -133,16 +133,32 @@ class ContinuousBatchingDecodeTest {
         MockPerformanceModel model = twoPointCurveModel();
         JavaMockEngineCluster.FastRpcService decode = newDecodeService(model, 132);
 
+        final class TimedQueue extends LinkedBlockingQueue<EngineRpcService.GenerateOutputsPB> {
+            volatile long terminalNanos;
+            @Override public boolean offer(EngineRpcService.GenerateOutputsPB value) {
+                if (value.getFlattenOutput().getFinishedCount() > 0
+                        && value.getFlattenOutput().getFinished(0))
+                    terminalNanos = System.nanoTime();
+                return super.offer(value);
+            }
+        }
+        var queueA = new TimedQueue();
+        var queueB = new TimedQueue();
+        var shapeA = shapeOf(model, 1L, 10, 2);
+        var shapeB = shapeOf(model, 2L, 10, 2);
+        Field lock = JavaMockEngineCluster.FastRpcService.class.getDeclaredField("decodeQueueLock");
+        lock.setAccessible(true);
         long t0 = System.nanoTime();
-        LinkedBlockingQueue<EngineRpcService.GenerateOutputsPB> queueA = new LinkedBlockingQueue<>();
-        LinkedBlockingQueue<EngineRpcService.GenerateOutputsPB> queueB = new LinkedBlockingQueue<>();
-        assertTrue(invokeScheduleDecodeCompletion(decode, shapeOf(model, 1L, 10, 2), -1, queueA));
-        assertTrue(invokeScheduleDecodeCompletion(decode, shapeOf(model, 2L, 10, 2), -1, queueB));
-        assertEquals(2, getActiveDecodeRequests(decode),
-                "both streams must be admitted into the running batch");
-
-        long doneA = awaitTerminalFrame(queueA, 10_000) - t0;
-        long doneB = awaitTerminalFrame(queueB, 10_000) - t0;
+        synchronized (lock.get(decode)) {
+            assertTrue(invokeScheduleDecodeCompletion(decode, shapeA, -1, queueA));
+            assertTrue(invokeScheduleDecodeCompletion(decode, shapeB, -1, queueB));
+            assertEquals(2, getActiveDecodeRequests(decode),
+                    "both streams must be admitted into the running batch");
+        }
+        awaitTerminalFrame(queueA, 10_000);
+        awaitTerminalFrame(queueB, 10_000);
+        long doneA = queueA.terminalNanos - t0;
+        long doneB = queueB.terminalNanos - t0;
         long tAMs = TimeUnit.NANOSECONDS.toMillis(doneA);
         long tBMs = TimeUnit.NANOSECONDS.toMillis(doneB);
 

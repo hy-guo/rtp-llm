@@ -81,6 +81,7 @@ def command(env):
         ("--decode-max-concurrency", "MOCK_DECODE_MAX_CONCURRENCY", 128),
         ("--event-loop-threads", "MOCK_EVENT_LOOP_THREADS", 4),
         ("--completion-threads", "MOCK_COMPLETION_THREADS", 4),
+        ("--grpc-max-inbound-message-bytes", "MOCK_GRPC_MAX_INBOUND_MESSAGE_BYTES", 2147483647),
     ):
         numeric[flag] = integer(env, key, default)
     performance = json_object(
@@ -102,6 +103,11 @@ def command(env):
             "--kmonitor", str(kmonitor).lower(), "--host", host,
             "--unique-engine-ips", "false", "--auto-fetch", str(not fetch).lower(),
             "--cache-status-compact-encoding", str(compact).lower()]
+    checkpoint = env.get("CHECKPOINT_PATH") or env.get("TOKENIZER_PATH")
+    if checkpoint:
+        from whale_frontend_fixture import prepare_assets
+        model = prepare_assets(checkpoint, runtime / "model-assets")
+        args.extend(["--model-path", str(model)])
     for flag, value in numeric.items():
         args.extend([flag, str(value)])
     for flag, name in (("--endpoint-file", "endpoints.json"),

@@ -170,3 +170,40 @@ Prefill ownership、Decode reservation/dispatch permit 和引擎负载应分别�
 公开入场路径仅支持单返回序列，不支持 beam 和多返回序列。相关输入在创建请求状态和 KV 租约前返回 UNIMPLEMENTED；Prefill 的形状计费工具可用于核对 real 的宽度公式，但不代表输出链路支持这些宽度。
 
 测试应明确验证的是模型内部不变量、协议路径还是跨进程行为，用具体断言表达预期及错误分支。
+
+## RPC 控制与多模态载荷
+
+Mock 的状态查询、取消和 P/D 控制 RPC 使用独立控制 executor，不消耗业务 callback 的并行槽或在途调用配额；业务 RPC 仍受原配额约束。业务等待可中断，取消后仍交付终态回调。这是 Mock 的资源隔离机制，对应真实 `LocalRpcServer::GetWorkerStatus`、`GetCacheStatus` 与异步引擎执行的职责分离，不表示使用了真实模型执行器。
+
+Prefill 的 VIT 调用保留图片顺序、像素和 canonical token 身份。大型 V4.1 多图请求按整张图片分组，以 32 MiB 或 8192 行作为组块目标；单张图片不拆分。所有组块共享剩余预算，独立 Future 等待同时受调用方 deadline 和 120 秒上限约束，超时或中断取消调用。预算依据真实 `MMGrpcTransport` 的 deadline/cancellation 传播；组块和独立等待是 Mock 专属保护。
+
+Mock 在完成图片校验、缓存键和请求形状计算后释放 tensor/patch 字节，保留 token、类型、长度、布局和内容身份供调度与输出使用。真实多模态处理器继续持有模型计算需要的 embedding；Mock 不执行模型计算，因此不能据此推断真实引擎的内存用量。
+
+
+### Generic V4.1 frontend boundary
+
+A generic frontend sends tokenizer IDs and URL media descriptors. It does not
+send prepared V4.1 patches or expanded token layout. With matching `--model-path`
+metadata, Mock ViT uses `deepseek_v41_processor.plan_image_grid` geometry and
+returns inline BF16 embeddings plus little-endian int32 row hashes. Mock Prefill
+expands one image placeholder per input, preserving the checkpoint's semantic
+image token. Cache-only row hashes follow
+`MultimodalProcessor::expandTokenIds` and
+`CompleteTokenIds::multimodalCacheIdentity`: the `-42` overlap identity stays in
+a backend-owned sidecar, including RemoteGenerate field 12 and local queue
+rematching. It is not accepted from frontend GenerateInput fields 11/12.
+Generic Prefill-to-ViT batches share one request budget and are bounded using
+model max image rows and BF16 width, targeting 8192 rows / 32 MiB per response.
+Whole images remain atomic; a single image may exceed that target. Text order
+and global cache-span offsets are restored after each bounded response.
+
+The V4.1 model hash seed also applies to text-only requests when model metadata
+is configured. Explicit `MOCK_CACHE_KEY_HASH_SEED` still overrides it. Existing
+prepared-image requests retain their original validation and identity contract.
+WorkerStatus field 28 is a present Int64Value, counting deduplicated admitted
+media through queueing, forward and cache publication; an idle worker reports
+present zero. It does not count waiters sharing the same image computation.
+
+Forward values remain deterministic CPU simulation, not model output. Inline
+transport needs no RDMA lease. These contracts do not establish GPU numerical
+parity, media safety inspection, video support or online performance acceptance.

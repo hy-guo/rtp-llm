@@ -8,7 +8,6 @@ import org.flexlb.dao.master.WorkerStatus;
 import org.flexlb.dao.route.RoleType;
 import org.flexlb.enums.BalanceStatusEnum;
 import org.flexlb.service.grpc.EngineGrpcService;
-import org.flexlb.service.grpc.EngineStatusConverter;
 import org.flexlb.service.monitor.EngineHealthReporter;
 import org.flexlb.sync.status.WorkerDirectory;
 import org.flexlb.util.CommonUtils;
@@ -110,15 +109,8 @@ public class GrpcCacheStatusCheckRunner implements Runnable {
             long startTime = System.nanoTime() / 1000;
             long currentCacheVersion = getCurrentCacheVersion();
 
-            engineGrpcService.getCacheStatusAsync(ip, grpcPort, workerStatus, currentCacheVersion,
+            engineGrpcService.getCacheStatusSnapshotAsync(ip, grpcPort, workerStatus, currentCacheVersion,
                             requestTimeoutMs, roleType)
-                    .thenApply(cacheStatusPB -> {
-                        logger.debug("gRPC Cache Status Response - handled for {}, role:{}, cache_key_size:{}, cache_version:{}, "
-                                        + "available_kv_cache:{}, total_kv_cache:{}, block_size:{}",
-                                ipPort, roleType.name(), cacheStatusPB.getCacheKeysMap().size(), cacheStatusPB.getVersion(),
-                                cacheStatusPB.getAvailableKvCache(), cacheStatusPB.getTotalKvCache(), cacheStatusPB.getBlockSize());
-                        return EngineStatusConverter.convertToCacheStatus(cacheStatusPB);
-                    })
                     .handleAsync((cacheStatus, failure) -> {
                         try {
                             Throwable cause = unwrapCompletionFailure(failure);

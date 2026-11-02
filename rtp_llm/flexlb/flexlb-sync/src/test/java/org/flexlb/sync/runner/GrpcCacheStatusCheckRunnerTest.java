@@ -1,5 +1,17 @@
 package org.flexlb.sync.runner;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.when;
+
 import org.flexlb.balance.endpoint.EndpointRegistry;
 import org.flexlb.cache.domain.WorkerCacheUpdateResult;
 import org.flexlb.cache.service.CacheAwareService;
@@ -16,18 +28,6 @@ import org.mockito.Mockito;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.LongAdder;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyInt;
-import static org.mockito.ArgumentMatchers.anyLong;
-import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.times;
-import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.verifyNoInteractions;
-import static org.mockito.Mockito.when;
-
 class GrpcCacheStatusCheckRunnerTest {
 
     private final EngineGrpcService engineGrpcService = Mockito.mock(EngineGrpcService.class);
@@ -43,14 +43,21 @@ class GrpcCacheStatusCheckRunnerTest {
     void decodeCacheResponseUpdatesCapacityWithoutBuildingDetailedIndex() {
         WorkerStatus status = RunnerTestSupport.discovered(
                 RoleType.DECODE, null, "127.0.0.1", 8080, 8081, "test-site");
-        EngineRpcService.CacheStatusPB response = EngineRpcService.CacheStatusPB.newBuilder()
-                .setVersion(1)
-                .setAvailableKvCache(1000)
-                .setTotalKvCache(2000)
-                .setBlockSize(128)
-                .build();
-        when(engineGrpcService.getCacheStatusAsync(
-                anyString(), anyInt(), eq(status), anyLong(), anyLong(), eq(RoleType.DECODE)))
+        org.flexlb.dao.master.CacheStatus response =
+                org.flexlb.service.grpc.EngineStatusConverter.convertToCacheStatus(
+                        EngineRpcService.CacheStatusPB.newBuilder()
+                                .setVersion(1)
+                                .setAvailableKvCache(1000)
+                                .setTotalKvCache(2000)
+                                .setBlockSize(128)
+                                .build());
+        when(engineGrpcService.getCacheStatusSnapshotAsync(
+                        anyString(),
+                        anyInt(),
+                        eq(status),
+                        anyLong(),
+                        anyLong(),
+                        eq(RoleType.DECODE)))
                 .thenReturn(CompletableFuture.completedFuture(response));
 
         new GrpcCacheStatusCheckRunner(
@@ -74,13 +81,22 @@ class GrpcCacheStatusCheckRunnerTest {
         WorkerStatus workerStatus = workerStatus();
         WorkerDirectory directory = directory(workerStatus);
 
-        EngineRpcService.CacheStatusPB cacheStatusPB = EngineRpcService.CacheStatusPB.newBuilder()
-                .setVersion(1)
-                .setAvailableKvCache(1000)
-                .setTotalKvCache(2000)
-                .setBlockSize(128)
-                .build();
-        when(engineGrpcService.getCacheStatusAsync(anyString(), anyInt(), any(WorkerStatus.class), anyLong(), anyLong(), eq(RoleType.PREFILL))).thenReturn(CompletableFuture.completedFuture(cacheStatusPB));
+        org.flexlb.dao.master.CacheStatus cacheStatusPB =
+                org.flexlb.service.grpc.EngineStatusConverter.convertToCacheStatus(
+                        EngineRpcService.CacheStatusPB.newBuilder()
+                                .setVersion(1)
+                                .setAvailableKvCache(1000)
+                                .setTotalKvCache(2000)
+                                .setBlockSize(128)
+                                .build());
+        when(engineGrpcService.getCacheStatusSnapshotAsync(
+                        anyString(),
+                        anyInt(),
+                        any(WorkerStatus.class),
+                        anyLong(),
+                        anyLong(),
+                        eq(RoleType.PREFILL)))
+                .thenReturn(CompletableFuture.completedFuture(cacheStatusPB));
         when(localKvCacheAwareManager.updateEngineBlockCache(workerStatus))
                 .thenReturn(WorkerCacheUpdateResult.builder()
                         .success(true)
@@ -105,7 +121,14 @@ class GrpcCacheStatusCheckRunnerTest {
         }
 
         // Assert
-        verify(engineGrpcService).getCacheStatusAsync(eq("127.0.0.1"), eq(8081), any(WorkerStatus.class), eq(-1L), eq(20L), eq(RoleType.PREFILL));
+        verify(engineGrpcService)
+                .getCacheStatusSnapshotAsync(
+                        eq("127.0.0.1"),
+                        eq(8081),
+                        any(WorkerStatus.class),
+                        eq(-1L),
+                        eq(20L),
+                        eq(RoleType.PREFILL));
         assertEquals(1L, workerStatus.getCacheIndexedVersion());
     }
 
@@ -114,19 +137,25 @@ class GrpcCacheStatusCheckRunnerTest {
         String ipPort = "127.0.0.1:8080";
         WorkerStatus workerStatus = workerStatus();
         WorkerDirectory directory = directory(workerStatus);
-        EngineRpcService.CacheStatusPB firstResponse =
-                EngineRpcService.CacheStatusPB.newBuilder()
-                        .setVersion(1)
-                        .setBlockSize(128)
-                        .build();
-        EngineRpcService.CacheStatusPB secondResponse =
-                EngineRpcService.CacheStatusPB.newBuilder()
-                        .setVersion(2)
-                        .setBlockSize(128)
-                        .build();
-        when(engineGrpcService.getCacheStatusAsync(
-                anyString(), anyInt(), any(WorkerStatus.class), anyLong(),
-                anyLong(), eq(RoleType.PREFILL)))
+        org.flexlb.dao.master.CacheStatus firstResponse =
+                org.flexlb.service.grpc.EngineStatusConverter.convertToCacheStatus(
+                        EngineRpcService.CacheStatusPB.newBuilder()
+                                .setVersion(1)
+                                .setBlockSize(128)
+                                .build());
+        org.flexlb.dao.master.CacheStatus secondResponse =
+                org.flexlb.service.grpc.EngineStatusConverter.convertToCacheStatus(
+                        EngineRpcService.CacheStatusPB.newBuilder()
+                                .setVersion(2)
+                                .setBlockSize(128)
+                                .build());
+        when(engineGrpcService.getCacheStatusSnapshotAsync(
+                        anyString(),
+                        anyInt(),
+                        any(WorkerStatus.class),
+                        anyLong(),
+                        anyLong(),
+                        eq(RoleType.PREFILL)))
                 .thenReturn(
                         CompletableFuture.completedFuture(firstResponse),
                         CompletableFuture.completedFuture(secondResponse),
@@ -155,12 +184,22 @@ class GrpcCacheStatusCheckRunnerTest {
 
         runCachePoll(ipPort, workerStatus, directory, false);
         assertEquals(2L, workerStatus.getCacheIndexedVersion());
-        verify(engineGrpcService).getCacheStatusAsync(
-                eq("127.0.0.1"), eq(8081), any(WorkerStatus.class),
-                eq(-1L), eq(20L), eq(RoleType.PREFILL));
-        verify(engineGrpcService, times(2)).getCacheStatusAsync(
-                eq("127.0.0.1"), eq(8081), any(WorkerStatus.class),
-                eq(1L), eq(20L), eq(RoleType.PREFILL));
+        verify(engineGrpcService)
+                .getCacheStatusSnapshotAsync(
+                        eq("127.0.0.1"),
+                        eq(8081),
+                        any(WorkerStatus.class),
+                        eq(-1L),
+                        eq(20L),
+                        eq(RoleType.PREFILL));
+        verify(engineGrpcService, times(2))
+                .getCacheStatusSnapshotAsync(
+                        eq("127.0.0.1"),
+                        eq(8081),
+                        any(WorkerStatus.class),
+                        eq(1L),
+                        eq(20L),
+                        eq(RoleType.PREFILL));
     }
 
     @Test
@@ -170,11 +209,15 @@ class GrpcCacheStatusCheckRunnerTest {
         WorkerDirectory directory = Mockito.mock(WorkerDirectory.class);
         when(directory.isCurrentStatus(
                 RoleType.PREFILL, ipPort, oldStatus)).thenReturn(false);
-        CompletableFuture<EngineRpcService.CacheStatusPB> response =
-                new CompletableFuture<>();
-        when(engineGrpcService.getCacheStatusAsync(
-                anyString(), anyInt(), any(WorkerStatus.class), anyLong(),
-                anyLong(), eq(RoleType.PREFILL))).thenReturn(response);
+        CompletableFuture<org.flexlb.dao.master.CacheStatus> response = new CompletableFuture<>();
+        when(engineGrpcService.getCacheStatusSnapshotAsync(
+                        anyString(),
+                        anyInt(),
+                        any(WorkerStatus.class),
+                        anyLong(),
+                        anyLong(),
+                        eq(RoleType.PREFILL)))
+                .thenReturn(response);
 
         GrpcCacheStatusCheckRunner runner = new GrpcCacheStatusCheckRunner(
                 "test-model", ipPort, "test-site", RoleType.PREFILL,
@@ -184,12 +227,14 @@ class GrpcCacheStatusCheckRunnerTest {
                 20, new LongAdder(), 50L, true, Runnable::run);
         runner.run();
 
-        response.complete(EngineRpcService.CacheStatusPB.newBuilder()
-                .setVersion(7)
-                .setAvailableKvCache(1000)
-                .setTotalKvCache(2000)
-                .setBlockSize(128)
-                .build());
+        response.complete(
+                org.flexlb.service.grpc.EngineStatusConverter.convertToCacheStatus(
+                        EngineRpcService.CacheStatusPB.newBuilder()
+                                .setVersion(7)
+                                .setAvailableKvCache(1000)
+                                .setTotalKvCache(2000)
+                                .setBlockSize(128)
+                                .build()));
 
         verify(localKvCacheAwareManager, never())
                 .updateEngineBlockCache(oldStatus);

@@ -203,13 +203,23 @@ class DirectPrefillCoalescingTest {
                 EngineRpcService.RoleTypePB.ROLE_TYPE_PREFILL, BASE_PORT, services,
                 scheduler, model, blocks, stats);
         services.put(BASE_PORT, prefill);
-        var first = generateAsync(prefill, input(5001, 3500));
-        var second = generateAsync(prefill, input(5002, 3500));
-        var last = generateAsync(prefill, input(5003, 3500));
-        assertFalse(second.isDone(), "temporary P KV shortage must queue, not reject");
-        assertFalse(last.isDone());
-        assertEquals(2, prefill.getWaitingCount());
-        if (cancelLast) prefill.cancel(5003);
+        var firstInput = input(5001, 3500);
+        var secondInput = input(5002, 3500);
+        var lastInput = input(5003, 3500);
+        var completionLock = JavaMockEngineCluster.FastRpcService.class.getDeclaredField("completionLock");
+        completionLock.setAccessible(true);
+        CompletableFuture<Throwable> first, second, last;
+        // Observe admission before completion can release KV; host scheduling
+        // pauses must not allow the first 500 ms batch to finish mid-assertion.
+        synchronized (completionLock.get(prefill)) {
+            first = generateAsync(prefill, firstInput);
+            second = generateAsync(prefill, secondInput);
+            last = generateAsync(prefill, lastInput);
+            assertFalse(second.isDone(), "temporary P KV shortage must queue, not reject");
+            assertFalse(last.isDone());
+            assertEquals(2, prefill.getWaitingCount());
+            if (cancelLast) prefill.cancel(5003);
+        }
         assertNull(first.get(5, TimeUnit.SECONDS));
         assertNull(second.get(5, TimeUnit.SECONDS));
         if (cancelLast) assertNotNull(last.get(5, TimeUnit.SECONDS));

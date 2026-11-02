@@ -12,7 +12,8 @@ import java.util.concurrent.Executor;
 /** D-side protocol adapter. Cache admission and execution remain in FastRpcService. */
 final class MockRemoteDecodeCall implements StreamObserver<EngineRpcService.GenerateRequestPB> {
     interface Backend {
-        Lease allocate(EngineRpcService.GenerateInputPB input, String clientId, Runnable stopped);
+        Lease allocate(EngineRpcService.GenerateInputPB input, String clientId, Runnable stopped,
+                       java.util.List<EngineRpcService.MultimodalCacheSpanPB> spans);
     }
 
     interface Lease {
@@ -57,7 +58,7 @@ final class MockRemoteDecodeCall implements StreamObserver<EngineRpcService.Gene
                 requestId = request.getRequestId();
                 clientId = request.getClientId();
                 lease = backend.allocate(request.getInput(), request.getClientId(),
-                        () -> executor.execute(() -> engineStopped()));
+                        () -> executor.execute(() -> engineStopped()), request.getMultimodalCacheSpansList());
                 if (lease == null) {
                     throw Status.RESOURCE_EXHAUSTED.withDescription("Decode ALLOCATE rejected")
                             .asRuntimeException();

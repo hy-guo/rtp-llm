@@ -209,7 +209,7 @@ Mock 不存储真实 KV tensor，事件位置只用于路由元数据验证，�
   `KV_CACHE_EVENT_HOST_IP_PORT`。独立 KVCM 的 registry namespace、VIP 和实例组
   不得指向其他部署。
 - 镜像需要打包 `whale-kvcm-discovery` profile 的 VipServer client。
-  未启用 publisher 时不创建网络客户端。错误上报不阻塞推理，恢复后重注册和全量快照对账。
+  未启用 publisher 时不创建网络客户端。错误上报不阻塞推理。恢复时先以心跳确认既有节点是否存活；存活则保持 generation 并对账快照，明确节点或实例缺失时重新注册，无法确认的错误继续退避。
 - `MOCK_KVCM_GROUPS_JSON` 可声明 tag、FULL/SWA/LINEAR、reuse、size_bytes；
   默认一个 FULL 组。组缺失模拟通过 `/cache_group_residency` 控制；这是 Mock 专属控制口。
 - 合成 cache fixture 与 publisher 互斥；普通请求缓存与一次性 natural seed 仍走同一设备缓存。
@@ -225,3 +225,20 @@ Prefill 的 WorkerStatus 反馈遵循 Master 当前 TaskInfo 字段号：运行�
 未模拟的时序保持 0，未模拟的分块进度保持 oneof 缺省；Decode 混合远端/本地来源的
 有效性反馈不在本项 Prefill 支持范围内。自动对账须按同一请求 ID 关联 Master 的
 `cache_hit_comparison`，不能用最终 Decode 响应里的 prefix 代替 Prefill 实际值。
+
+### 大消息与发布恢复配置
+
+- `MOCK_GRPC_MAX_INBOUND_MESSAGE_BYTES` 控制 Mock P/D 的接收上限；`MOCK_VIT_MAX_INPUT_BYTES`、`MOCK_VIT_MAX_OUTPUT_BYTES`、`MOCK_VIT_GRPC_MAX_INBOUND_BYTES` 分别控制 VIT 单次载荷、输出和 RPC 接收上限，`MOCK_VIT_QUEUE_CAPACITY` 控制等待队列容量。它们是 Mock 的显式保护参数，不会裁剪图片或 token。
+- Master 的 `flexlb.engine-grpc.cache-max-inbound-message-bytes` 仅作用于 LLM 缓存状态 RPC，默认 64 MiB；普通 WorkerStatus 和 VIT 的独立限制保持各自配置。缓存同步按原 `CacheStatusPB` wire 直接建立自有 primitive 键快照，不保留整份 protobuf Map；旧客户端接口仍可使用。
+- `MOCK_KVCM_SNAPSHOT_MIN_INTERVAL_MS` 控制相邻快照尝试完成后的最短间隔，默认 31000 ms，配合 KVCM 默认 30 秒提交间隔；服务端 `retry_after` 仍生效。`MOCK_KVCM_INITIAL_SNAPSHOT_SPREAD_MS` 和 `MOCK_KVCM_RETRY_SNAPSHOT_SPREAD_MS` 是按引擎地址确定的错峰窗口，默认 0；等待不占用 HTTP 超时预算，也不阻止独立心跳。窗口按部署规模配置，不作为计算耗时模型的一部分。
+- 标准 `rtp_llm_kv_cache_evicted_block_lifetime_ms` 透传实际 Mock entry 淘汰年龄，标记 `lifetime_source=mock_cache_entry`，DEVICE/HOST 对应设备/内存缓存；空闲时不造零点。它不证明真实 GPU、混合缓存组或异步降层行为。
+
+这些机制直接由构建源码提供，不需要启动时替换 class 或注入修复 agent。默认启动不额外填充合成背景缓存键；容量、实际驻留键数与请求命中率分别验收。
+
+
+Generic V4.1 frontends require the same checkpoint metadata on Mock Prefill,
+Decode and ViT. The engine launcher resolves `CHECKPOINT_PATH` (or
+`TOKENIZER_PATH`) with the existing metadata loader and passes `--model-path`;
+ViT already uses that option. Missing metadata produces an explicit precondition
+error for URL-only requests rather than assuming a token ID or Qwen geometry.
+No frontend symbol replacement or runtime agent is required for this path.

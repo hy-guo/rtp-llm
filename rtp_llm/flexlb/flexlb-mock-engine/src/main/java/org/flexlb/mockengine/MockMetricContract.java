@@ -82,6 +82,7 @@ final class MockMetricContract {
         metric("rtp_llm_input_token_length", null, "Whale engine observation", Type.GAUGE, Unit.TOKENS, Role.BOTH, Aggregation.NONE, Sampling.EVENT),
         metric("mock_cache_direct_evicted_blocks", null, "Whale engine observation", Type.GAUGE, Unit.BLOCKS, Role.BOTH, Aggregation.NONE, Sampling.EVENT),
         metric("mock_cache_evicted_entry_age_ms", null, "Whale engine observation", Type.GAUGE, Unit.MILLISECONDS, Role.BOTH, Aggregation.NONE, Sampling.EVENT),
+        metric("rtp_llm_kv_cache_evicted_block_lifetime_ms", null, "actual mock entry residency at eviction", Type.GAUGE, Unit.MILLISECONDS, Role.BOTH, Aggregation.NONE, Sampling.EVENT),
         metric("mock_kv_cache_hit_rate", null, "one-minute token-weighted cache hit percentage", Type.GAUGE, Unit.PERCENT, Role.BOTH, Aggregation.NONE, Sampling.SNAPSHOT),
         metric("rtp_llm_kv_cache_item_num", null, "Whale engine observation", Type.GAUGE, Unit.BLOCKS, Role.BOTH, Aggregation.NONE, Sampling.SNAPSHOT),
         metric("rtp_llm_kv_cache_left_seq", null, "Whale engine observation", Type.GAUGE, Unit.TOKENS, Role.BOTH, Aggregation.NONE, Sampling.SNAPSHOT),

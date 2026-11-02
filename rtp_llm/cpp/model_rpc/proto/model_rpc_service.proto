@@ -440,6 +440,12 @@ enum RemoteStage {
     PREFILL_COMPLETE = 3;
 }
 
+// Backend-owned cache identity; never supplied through GenerateInputPB.
+message MultimodalCacheSpanPB {
+    int32 offset = 1;
+    repeated sint32 row_hashes = 2;
+}
+
 message GenerateRequestPB {
     RemoteStage stage = 1;
     int64 request_id = 2;
@@ -452,6 +458,7 @@ message GenerateRequestPB {
     repeated int32 position_ids = 9;
     TensorPB propose_probs = 10;
     TensorPB propose_hidden = 11;
+    repeated MultimodalCacheSpanPB multimodal_cache_spans = 12;
 }
 
 // In the TP case, the decode master broadcasts to decode workers.
@@ -714,6 +721,8 @@ message WorkerStatusPB {
     int64 max_batch_tokens_size = 22;
     int64 block_size = 23;
     int32 block_hash_lookahead_tokens = 24;
+    // Deduplicated admitted media: queue, forward and publication. Presence matters.
+    google.protobuf.Int64Value mm_inflight_inputs = 28;
     KvCacheGroupModePB kv_cache_group_mode = 25;
     int32 cache_match_rollback_blocks = 26;
 }

@@ -91,7 +91,11 @@ def start_mock_vit(model):
     args = [java, '-Xms64m', '-Xmx512m', '-Djava.awt.headless=true', '-cp', str(jar),
             'org.flexlb.mockengine.MockVitServer', '--port', str(port), '--model-path', str(model),
             '--concurrency', os.environ.get('VIT_MAX_CONCURRENT_REQUESTS', '32'),
-            '--embedding-cache-bytes', os.environ.get('MOCK_VIT_CACHE_BYTES', '0')]
+            '--queue-capacity', os.environ.get('MOCK_VIT_QUEUE_CAPACITY', '2048'),
+            '--embedding-cache-bytes', os.environ.get('MOCK_VIT_CACHE_BYTES', '0'),
+            '--max-input-bytes', os.environ.get('MOCK_VIT_MAX_INPUT_BYTES', str(512 << 20)),
+            '--max-output-bytes', os.environ.get('MOCK_VIT_MAX_OUTPUT_BYTES', str(512 << 20)),
+            '--grpc-max-inbound-bytes', os.environ.get('MOCK_VIT_GRPC_MAX_INBOUND_BYTES', str(1024 << 20))]
     child = subprocess.Popen(args)
     channel = grpc.insecure_channel('127.0.0.1:' + str(port))
     stub = MultimodalRpcServiceStub(channel)

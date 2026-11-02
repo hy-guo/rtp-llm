@@ -11,14 +11,14 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.ArrayDeque;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BooleanSupplier;
 
 /**
@@ -45,11 +45,101 @@ final class KvcmEventPublisher implements AutoCloseable {
                 throw new IllegalArgumentException("invalid model metadata; publisher requires pp=1");
         }
     }
-    record Config(URI endpoint, String group, String instance, String model,
-                  int queueCapacity, int batchSize, int flushMs, int heartbeatMs,
-                  int snapshotMs, int timeoutMs, int retryMs, int maxRetryMs, String storageType,
-                  List<Group> groups, Discovery discovery, int snapshotTimeoutMs, int maxRetryAfterMs,
-                  boolean appendBlockSize, ModelMetadata metadata) {
+
+    record Config(
+            URI endpoint,
+            String group,
+            String instance,
+            String model,
+            int queueCapacity,
+            int batchSize,
+            int flushMs,
+            int heartbeatMs,
+            int snapshotMs,
+            int timeoutMs,
+            int retryMs,
+            int maxRetryMs,
+            String storageType,
+            List<Group> groups,
+            Discovery discovery,
+            int snapshotTimeoutMs,
+            int maxRetryAfterMs,
+            boolean appendBlockSize,
+            ModelMetadata metadata,
+            int snapshotMinIntervalMs,
+            int initialSnapshotSpreadMs,
+            int retrySnapshotSpreadMs) {
+        Config(
+                URI endpoint,
+                String group,
+                String instance,
+                String model,
+                int queueCapacity,
+                int batchSize,
+                int flushMs,
+                int heartbeatMs,
+                int snapshotMs,
+                int timeoutMs,
+                int retryMs,
+                int maxRetryMs,
+                String storageType,
+                List<Group> groups,
+                Discovery discovery,
+                int snapshotTimeoutMs,
+                int maxRetryAfterMs,
+                boolean appendBlockSize,
+                ModelMetadata metadata) {
+            this(
+                    endpoint,
+                    group,
+                    instance,
+                    model,
+                    queueCapacity,
+                    batchSize,
+                    flushMs,
+                    heartbeatMs,
+                    snapshotMs,
+                    timeoutMs,
+                    retryMs,
+                    maxRetryMs,
+                    storageType,
+                    groups,
+                    discovery,
+                    snapshotTimeoutMs,
+                    maxRetryAfterMs,
+                    appendBlockSize,
+                    metadata,
+                    31000,
+                    0,
+                    0);
+        }
+
+        Config withSnapshotTiming(int minimumMs, int initialSpreadMs, int retrySpreadMs) {
+            return new Config(
+                    endpoint,
+                    group,
+                    instance,
+                    model,
+                    queueCapacity,
+                    batchSize,
+                    flushMs,
+                    heartbeatMs,
+                    snapshotMs,
+                    timeoutMs,
+                    retryMs,
+                    maxRetryMs,
+                    storageType,
+                    groups,
+                    discovery,
+                    snapshotTimeoutMs,
+                    maxRetryAfterMs,
+                    appendBlockSize,
+                    metadata,
+                    minimumMs,
+                    initialSpreadMs,
+                    retrySpreadMs);
+        }
+
         Config(URI endpoint, String group, String instance, String model, int queueCapacity, int batchSize,
                int flushMs, int heartbeatMs, int snapshotMs, int timeoutMs, int retryMs, int maxRetryMs, String storageType,
                List<Group> groups, Discovery discovery, int snapshotTimeoutMs, int maxRetryAfterMs, boolean appendBlockSize) {
@@ -69,13 +159,35 @@ final class KvcmEventPublisher implements AutoCloseable {
                     List.of(new Group("full", "FULL", true, 4096)), null, 30000, 300000, false);
         }
         Config {
-            if ((endpoint == null && (discovery == null || discovery.address() == null || discovery.address().isBlank()))
-                    || (endpoint != null && (!("http".equals(endpoint.getScheme()) || "https".equals(endpoint.getScheme()))
-                    || endpoint.getHost() == null || endpoint.getUserInfo() != null || endpoint.getQuery() != null || endpoint.getFragment() != null))
-                    || group.isBlank() || instance.isBlank() || model.isBlank()
-                    || !("ST_EVENT_REPORT".equals(storageType) || "ST_EVENT_REPORT_L1P5".equals(storageType))
-                    || queueCapacity <= 0 || batchSize <= 0 || flushMs <= 0 || heartbeatMs <= 0 || snapshotMs <= 0
-                    || timeoutMs <= 0 || retryMs <= 0 || maxRetryMs < retryMs || snapshotTimeoutMs <= 0 || maxRetryAfterMs <= 0)
+            if ((endpoint == null
+                            && (discovery == null
+                                    || discovery.address() == null
+                                    || discovery.address().isBlank()))
+                    || (endpoint != null
+                            && (!("http".equals(endpoint.getScheme())
+                                            || "https".equals(endpoint.getScheme()))
+                                    || endpoint.getHost() == null
+                                    || endpoint.getUserInfo() != null
+                                    || endpoint.getQuery() != null
+                                    || endpoint.getFragment() != null))
+                    || group.isBlank()
+                    || instance.isBlank()
+                    || model.isBlank()
+                    || !("ST_EVENT_REPORT".equals(storageType)
+                            || "ST_EVENT_REPORT_L1P5".equals(storageType))
+                    || queueCapacity <= 0
+                    || batchSize <= 0
+                    || flushMs <= 0
+                    || heartbeatMs <= 0
+                    || snapshotMs <= 0
+                    || snapshotMinIntervalMs < 0
+                    || initialSnapshotSpreadMs < 0
+                    || retrySnapshotSpreadMs < 0
+                    || timeoutMs <= 0
+                    || retryMs <= 0
+                    || maxRetryMs < retryMs
+                    || snapshotTimeoutMs <= 0
+                    || maxRetryAfterMs <= 0)
                 throw new IllegalArgumentException("invalid KVCM event configuration");
             groups = groups.stream().filter(Group::published).toList();
             if (groups.isEmpty() || groups.stream().map(Group::tag).distinct().count() != groups.size())
@@ -90,7 +202,9 @@ final class KvcmEventPublisher implements AutoCloseable {
             String deployment = env.getOrDefault("BIZ_NAME", "") + "/" + env.getOrDefault("DEPLOYMENT_NAME", "");
             String instance = env.getOrDefault("KV_CACHE_EVENT_INSTANCE_ID", deployment.equals("/") ? "" : deployment);
             if (!env.getOrDefault("KV_CACHE_EVENT_HOST_IP_PORT", "").isBlank())
-                throw new IllegalArgumentException("Mock derives a unique host:HTTP-port for every engine; remove KV_CACHE_EVENT_HOST_IP_PORT");
+                throw new IllegalArgumentException(
+                        "Mock derives a unique host:HTTP-port for every engine; remove"
+                                + " KV_CACHE_EVENT_HOST_IP_PORT");
             boolean vip = env.getOrDefault("RECO_ENABLE_VIPSERVER", "0").equals("1");
             Discovery discovery = new Discovery(vip, env.getOrDefault(vip ? "RECO_VIPSERVER_DOMAIN" : "RECO_SERVER_ADDRESS", ""));
             List<Group> groups = new ArrayList<>();
@@ -101,19 +215,37 @@ final class KvcmEventPublisher implements AutoCloseable {
                 for (JsonNode item : input) groups.add(new Group(item.path("tag").asText(), item.path("type").asText(),
                         item.path("reuse").asBoolean(true), item.path("size_bytes").asLong()));
             } catch (java.io.IOException error) { throw new IllegalArgumentException("invalid MOCK_KVCM_GROUPS_JSON", error); }
-            return new Config(endpoint.isBlank() ? null : URI.create(endpoint.replaceAll("/+$", "")),
-                    env.getOrDefault("KV_CACHE_EVENT_INSTANCE_GROUP", env.getOrDefault("RECO_INSTANCE_GROUP", "")),
-                    instance, env.getOrDefault("MODEL_TYPE", "mock"),
-                    integer(env, "QUEUE_CAPACITY", 100000), integer(env, "BATCH_SIZE", 1000),
-                    integer(env, "FLUSH_MS", 20), integer(env, "HEARTBEAT_MS", 1000),
-                    integer(env, "SNAPSHOT_MS", 300000), integer(env, "TIMEOUT_MS", 1500),
-                    integer(env, "RETRY_MS", 500), integer(env, "MAX_RETRY_MS", 16000),
-                    env.getOrDefault("MOCK_KVCM_STORAGE_TYPE", "ST_EVENT_REPORT_L1P5"), groups, discovery,
-                    integer(env, "SNAPSHOT_TIMEOUT_MS", 30000), integer(env, "MAX_RETRY_AFTER_MS", 300000),
+            return new Config(
+                    endpoint.isBlank() ? null : URI.create(endpoint.replaceAll("/+$", "")),
+                    env.getOrDefault(
+                            "KV_CACHE_EVENT_INSTANCE_GROUP",
+                            env.getOrDefault("RECO_INSTANCE_GROUP", "")),
+                    instance,
+                    env.getOrDefault("MODEL_TYPE", "mock"),
+                    integer(env, "QUEUE_CAPACITY", 100000),
+                    integer(env, "BATCH_SIZE", 1000),
+                    integer(env, "FLUSH_MS", 20),
+                    integer(env, "HEARTBEAT_MS", 1000),
+                    integer(env, "SNAPSHOT_MS", 300000),
+                    integer(env, "TIMEOUT_MS", 1500),
+                    integer(env, "RETRY_MS", 500),
+                    integer(env, "MAX_RETRY_MS", 16000),
+                    env.getOrDefault("MOCK_KVCM_STORAGE_TYPE", "ST_EVENT_REPORT_L1P5"),
+                    groups,
+                    discovery,
+                    integer(env, "SNAPSHOT_TIMEOUT_MS", 30000),
+                    integer(env, "MAX_RETRY_AFTER_MS", 300000),
                     Boolean.parseBoolean(env.getOrDefault("MOCK_KVCM_APPEND_BLOCK_SIZE", "false")),
-                    new ModelMetadata(env.getOrDefault("MOCK_KVCM_DTYPE", "fp16"),
+                    new ModelMetadata(
+                            env.getOrDefault("MOCK_KVCM_DTYPE", "fp16"),
                             Boolean.parseBoolean(env.getOrDefault("MOCK_KVCM_USE_MLA", "false")),
-                            integer(env, "TP_SIZE", 1), integer(env, "DP_SIZE", 1), integer(env, "PP_SIZE", 1), integer(env, "DP_RANK", 0)));
+                            integer(env, "TP_SIZE", 1),
+                            integer(env, "DP_SIZE", 1),
+                            integer(env, "PP_SIZE", 1),
+                            integer(env, "DP_RANK", 0)),
+                    integer(env, "SNAPSHOT_MIN_INTERVAL_MS", 31000),
+                    integer(env, "INITIAL_SNAPSHOT_SPREAD_MS", 0),
+                    integer(env, "RETRY_SNAPSHOT_SPREAD_MS", 0));
         }
         private static int integer(Map<String, String> env, String name, int fallback) {
             return Integer.parseInt(env.getOrDefault("MOCK_KVCM_" + name, Integer.toString(fallback)));
@@ -145,41 +277,58 @@ final class KvcmEventPublisher implements AutoCloseable {
     private KvcmEndpointResolver endpointResolver;
     private volatile boolean registered;
     private boolean hostDownPending;
+    private long nextSnapshotSendNs;
+    private long snapshotAttempts;
     private long cutoff, reconciled;
     private record Pending(String body, long version, long generation) {}
     private Pending pending;
 
-    /** Cache-side offer never waits for a consumer, including snapshot pruning. */
-    private static final class MutationQueue {
+    /** Bounded multi-producer queue; the publisher worker is the only consumer. */
+    static final class MutationQueue {
         private final int capacity;
-        private final ArrayDeque<MockLruBlockCache.Mutation> entries = new ArrayDeque<>();
-        private final ReentrantLock lock = new ReentrantLock();
-        private volatile int depth;
+        private final ConcurrentLinkedQueue<MockLruBlockCache.Mutation> entries =
+                new ConcurrentLinkedQueue<>();
+        private final AtomicInteger depth = new AtomicInteger();
+
         MutationQueue(int capacity) { this.capacity = capacity; }
         boolean offer(MockLruBlockCache.Mutation mutation) {
-            if (!lock.tryLock()) return false;
+            java.util.Objects.requireNonNull(mutation);
+            int current;
+            do {
+                current = depth.get();
+                if (current >= capacity) return false;
+            } while (!depth.compareAndSet(current, current + 1));
             try {
-                if (entries.size() == capacity) return false;
-                entries.addLast(mutation);
-                depth = entries.size();
+                entries.offer(mutation);
                 return true;
-            } finally { lock.unlock(); }
+            } catch (RuntimeException | Error e) {
+                depth.decrementAndGet();
+                throw e;
+            }
         }
         void drainTo(List<MockLruBlockCache.Mutation> batch, int limit) {
-            lock.lock();
-            try {
-                while (!entries.isEmpty() && batch.size() < limit) batch.add(entries.removeFirst());
-                depth = entries.size();
-            } finally { lock.unlock(); }
+            while (batch.size() < limit) {
+                var mutation = entries.poll();
+                if (mutation == null) break;
+                depth.decrementAndGet();
+                batch.add(mutation);
+            }
         }
         void discardThrough(long version) {
-            lock.lock();
-            try {
-                entries.removeIf(mutation -> mutation.version() <= version);
-                depth = entries.size();
-            } finally { lock.unlock(); }
+            // The sole consumer removes old entries. Concurrent producers may
+            // publish a reserved old-version entry later; the existing parent
+            // publisher also filters every drained entry against its cutoff.
+            var iterator = entries.iterator();
+            while (iterator.hasNext())
+                if (iterator.next().version() <= version) {
+                    iterator.remove();
+                    depth.decrementAndGet();
+                }
         }
-        int size() { return depth; }
+
+        int size() {
+            return depth.get();
+        }
     }
 
     KvcmEventPublisher(Config config, MockLruBlockCache cache, String host, int blockSize,
@@ -195,6 +344,8 @@ final class KvcmEventPublisher implements AutoCloseable {
         this.available = available;
         this.transport = transport == null ? httpTransport(config) : transport;
         queue = new MutationQueue(config.queueCapacity());
+        nextSnapshotSendNs =
+                System.nanoTime() + snapshotSpreadNs(config.initialSnapshotSpreadMs(), 0);
     }
 
     private Transport httpTransport(Config config) {
@@ -219,36 +370,40 @@ final class KvcmEventPublisher implements AutoCloseable {
         };
     }
 
-    record Feedback(boolean valid, boolean ok, boolean registrationRequired, boolean snapshotRequired, long retryAfterMs) {}
+    record Feedback(boolean valid, boolean ok, boolean registrationRequired, boolean snapshotRequired, long retryAfterMs, boolean registrationAbsent) {}
     static Feedback parseFeedback(String response) {
         try {
             JsonNode root = JSON.readTree(response);
             JsonNode status = root.path("header").path("status").path("code");
             if (status.isMissingNode() || !(status.isNumber() || status.isTextual() || status.isObject()))
-                return new Feedback(false, false, false, false, 0);
+                return new Feedback(false, false, false, false, 0, false);
             boolean ok = codeOk(status), registration = registrationCode(status), snapshot = matches(status, 14, "SNAPSHOT_REQUIRED");
+            boolean absent = registrationAbsent(status);
             JsonNode hint = root.has("snapshot_required") ? root.get("snapshot_required") : root.get("snapshotRequired");
-            if (hint != null) { if (!hint.isBoolean()) return new Feedback(false, false, false, false, 0); snapshot |= hint.asBoolean(); }
+            if (hint != null) { if (!hint.isBoolean()) return new Feedback(false, false, false, false, 0, false); snapshot |= hint.asBoolean(); }
             long delay = 0;
             JsonNode retry = root.has("retry_after_ms") ? root.get("retry_after_ms") : root.get("retryAfterMs");
             if (retry != null) {
-                if (!(retry.isIntegralNumber() || retry.isTextual())) return new Feedback(false, false, false, false, 0);
+                if (!(retry.isIntegralNumber() || retry.isTextual())) return new Feedback(false, false, false, false, 0, false);
                 var parsed = new java.math.BigInteger(retry.asText());
-                if (parsed.signum() < 0 || parsed.bitLength() > 64) return new Feedback(false, false, false, false, 0);
-                if (!retry.asText().matches("[0-9]+")) return new Feedback(false, false, false, false, 0);
+                if (parsed.signum() < 0 || parsed.bitLength() > 64) return new Feedback(false, false, false, false, 0, false);
+                if (!retry.asText().matches("[0-9]+")) return new Feedback(false, false, false, false, 0, false);
                 delay = parsed.min(java.math.BigInteger.valueOf(Long.MAX_VALUE)).longValue();
             }
             JsonNode items = root.has("item_results") ? root.get("item_results") : root.get("itemResults");
             if (items != null) {
-                if (!items.isArray()) return new Feedback(false, false, false, false, 0);
-                for (JsonNode item : items) { ok &= codeOk(item); registration |= registrationCode(item); snapshot |= matches(item, 14, "SNAPSHOT_REQUIRED"); }
+                if (!items.isArray()) return new Feedback(false, false, false, false, 0, false);
+                for (JsonNode item : items) { ok &= codeOk(item); registration |= registrationCode(item); absent |= registrationAbsent(item); snapshot |= matches(item, 14, "SNAPSHOT_REQUIRED"); }
             }
-            return new Feedback(true, ok, registration, snapshot, delay);
-        } catch (Exception error) { return new Feedback(false, false, false, false, 0); }
+            return new Feedback(true, ok, registration, snapshot, delay, absent);
+        } catch (Exception error) { return new Feedback(false, false, false, false, 0, false); }
     }
     private static boolean matches(JsonNode node, int code, String name) {
         if (node.isObject()) return matches(node.has("code") ? node.get("code") : node.path("status"), code, name);
         return node.isIntegralNumber() ? node.asLong() == code : node.isTextual() && (node.asText().equals(name) || node.asText().equals(Integer.toString(code)));
+    }
+    private static boolean registrationAbsent(JsonNode node) {
+        return matches(node, 8, "INSTANCE_NOT_EXIST") || matches(node, 10, "NODE_NOT_REGISTERED");
     }
     private static boolean registrationCode(JsonNode node) {
         return matches(node, 8, "INSTANCE_NOT_EXIST") || matches(node, 9, "SERVER_NOT_LEADER") || matches(node, 10, "NODE_NOT_REGISTERED");
@@ -374,6 +529,15 @@ final class KvcmEventPublisher implements AutoCloseable {
         return post("/api/reportEvent", control(type, payload).toString());
     }
 
+    private long snapshotSpreadNs(int windowMs, long attempt) {
+        if (windowMs == 0) return 0;
+        long hash = host.hashCode() * 0x9e3779b97f4a7c15L + attempt;
+        hash = (hash ^ (hash >>> 30)) * 0xbf58476d1ce4e5b9L;
+        hash = (hash ^ (hash >>> 27)) * 0x94d049bb133111ebL;
+        return TimeUnit.MILLISECONDS.toNanos(
+                Math.floorMod(hash ^ (hash >>> 31), (long) windowMs + 1));
+    }
+
     private void run() {
         int backoff = config.retryMs();
         long snapshotAt = 0;
@@ -397,17 +561,29 @@ final class KvcmEventPublisher implements AutoCloseable {
                     long pause = retryDeadline.get() - System.nanoTime();
                     if (pause > 0) { Thread.sleep(Math.min(100, Math.max(1, TimeUnit.NANOSECONDS.toMillis(pause)))); continue; }
                     if (!registered) {
-                        // New registration needs current authoritative state, never replay an old owner's pending snapshot.
-                        pending = null;
+                        lifecycle.writeLock().lock();
+                        try {
+                            if (!registered) {
+                                boolean live = hostDownPending && control("EVENT_HEARTBEAT");
+                                if (!live && hostDownPending) {
+                                    Feedback result = feedback.get();
+                                    if (result == null || !result.registrationAbsent())
+                                        throw new IllegalStateException(
+                                                "node recovery acknowledgement unavailable");
+                                }
+                                if (!live) {
+                                    pending = null;
                         if (!post("/api/registerInstance", registration().toString()))
                             throw new IllegalStateException("registration rejected");
-                        // An uncertain node-register acknowledgement may still
-                        // have created this owner. Keep cleanup pending until
-                        // HOST_DOWN is acknowledged, including during close.
                         hostDownPending = true;
                         if (!control("EVENT_NODE_REGISTER")) throw new IllegalStateException("node registration rejected");
-                        registered = true;
+                                }
+                                registered = true;
                         dirty.incrementAndGet();
+                            }
+                        } finally {
+                            lifecycle.writeLock().unlock();
+                        }
                     }
                     long now = System.nanoTime();
                     if (now >= snapshotAt) {
@@ -416,6 +592,12 @@ final class KvcmEventPublisher implements AutoCloseable {
                     }
                     if (pending != null || reconciled != dirty.get() || requestedSnapshotEpoch.get() > snapshotEpoch.get()) {
                         state = "RESYNCING";
+                        long waitNs = nextSnapshotSendNs - System.nanoTime();
+                        if (waitNs > 0) {
+                            TimeUnit.NANOSECONDS.sleep(
+                                    Math.min(waitNs, TimeUnit.MILLISECONDS.toNanos(100)));
+                            continue;
+                        }
                         if (pending == null) {
                             long generation = dirty.get();
                             var snapshot = cache.componentSnapshot();
@@ -430,7 +612,15 @@ final class KvcmEventPublisher implements AutoCloseable {
                         }
                         // Retry the identical snapshot until acknowledged; do not
                         // replace an uncertain request with a newer snapshot.
-                        if (!post("/api/reportEvent", pending.body())) throw new IllegalStateException("snapshot rejected");
+                        snapshotAttempts++;
+                        try {
+                            if (!post("/api/reportEvent", pending.body()))
+                                throw new IllegalStateException("snapshot rejected");
+                        } finally {
+                            nextSnapshotSendNs = System.nanoTime()
+                                    + TimeUnit.MILLISECONDS.toNanos(config.snapshotMinIntervalMs())
+                                    + snapshotSpreadNs(config.retrySnapshotSpreadMs(), snapshotAttempts);
+                        }
                         cutoff = pending.version();
                         queue.discardThrough(cutoff);
                         reconciled = pending.generation();

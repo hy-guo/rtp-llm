@@ -1,8 +1,11 @@
 package org.flexlb.mockengine;
 
+import static org.junit.jupiter.api.Assertions.*;
+
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpServer;
+
 import org.junit.jupiter.api.Test;
 
 import java.net.InetSocketAddress;
@@ -21,15 +24,25 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
 
-import static org.junit.jupiter.api.Assertions.*;
-
 class KvcmEventPublisherTest {
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final String OK = "{\"header\":{\"status\":{\"code\":\"OK\"}}}";
 
     private static KvcmEventPublisher.Config config(URI endpoint, int capacity) {
-        return new KvcmEventPublisher.Config(endpoint, "test-group", "test-deployment", "mock-model",
-                capacity, 16, 5, 30, 10000, 500, 5, 50);
+        return new KvcmEventPublisher.Config(
+                        endpoint,
+                        "test-group",
+                        "test-deployment",
+                        "mock-model",
+                        capacity,
+                        16,
+                        5,
+                        30,
+                        10000,
+                        500,
+                        5,
+                        50)
+                .withSnapshotTiming(0, 0, 0);
     }
     private static KvcmEventPublisher.Config config(int capacity) {
         return config(URI.create("http://127.0.0.1:1"), capacity);
@@ -189,7 +202,8 @@ class KvcmEventPublisherTest {
         } finally { peer.snapshotRelease.countDown(); }
     }
 
-    @Test void lostSnapshotAckReregistersAndReconcilesCurrentState() throws Exception {
+    @Test
+    void lostSnapshotAckRetainsLiveGenerationAndRetriesIdenticalSnapshot() throws Exception {
         var cache = new MockLruBlockCache(16);
         cache.admit(List.of(1L));
         var peer = new Peer();
@@ -197,7 +211,9 @@ class KvcmEventPublisherTest {
         try (var publisher = new KvcmEventPublisher(config(64), cache, "host:1", 128, () -> true, peer)) {
             publisher.start();
             until(() -> peer.snapshots().size() >= 2 && publisher.status().get("state").equals("READY"));
-            assertTrue(peer.requests.stream().filter(root -> root.has("instance_group")).count() >= 2);
+            assertEquals(
+                    1, peer.requests.stream().filter(root -> root.has("instance_group")).count());
+            assertEquals(peer.snapshots().get(0), peer.snapshots().get(1));
             assertTrue((long) publisher.status().get("failures") >= 1);
             assertEquals(Set.of(1L), peer.keys);
         }
@@ -262,8 +278,21 @@ class KvcmEventPublisherTest {
         cache.admit(List.of(8L));
         var peer = new Peer();
         var base = config(64);
-        var periodic = new KvcmEventPublisher.Config(base.endpoint(), base.group(), base.instance(), base.model(),
-                64, 16, 5, 30, 80, 500, 5, 50);
+        var periodic =
+                new KvcmEventPublisher.Config(
+                                base.endpoint(),
+                                base.group(),
+                                base.instance(),
+                                base.model(),
+                                64,
+                                16,
+                                5,
+                                30,
+                                80,
+                                500,
+                                5,
+                                50)
+                        .withSnapshotTiming(0, 0, 0);
         try (var publisher = new KvcmEventPublisher(periodic, cache, "host:1", 128, () -> true, peer)) {
             publisher.start();
             until(() -> publisher.status().get("state").equals("READY"));
@@ -344,6 +373,102 @@ class KvcmEventPublisherTest {
             assertEquals(2, attempts.get());
             assertEquals(1, peer.events("EVENT_HOST_DOWN").size());
             assertEquals("CLOSED", publisher.status().get("state"));
+        }
+    }
+
+    @Test
+    void mutationQueueRejectsOnlyCapacityAndPrunesOldVersions() throws Exception {
+        int writers = 8, perWriter = 15000;
+        var queue = new KvcmEventPublisher.MutationQueue(writers * perWriter);
+        var start = new CountDownLatch(1);
+        var rejected = new AtomicInteger();
+        try (var pool = java.util.concurrent.Executors.newFixedThreadPool(writers)) {
+            var futures = new ArrayList<java.util.concurrent.Future<?>>();
+            for (int worker = 0; worker < writers; worker++) {
+                final int id = worker;
+                futures.add(
+                        pool.submit(
+                                () -> {
+                                    try {
+                                        start.await();
+                                    } catch (InterruptedException e) {
+                                        throw new RuntimeException(e);
+                                    }
+                                    for (int i = 0; i < perWriter; i++) {
+                                        long key = (long) id * perWriter + i;
+                                        if (!queue.offer(
+                                                new MockLruBlockCache.Mutation(key, key, true)))
+                                            rejected.incrementAndGet();
+                                    }
+                                }));
+            }
+            start.countDown();
+            for (var future : futures) future.get(10, TimeUnit.SECONDS);
+        }
+        assertEquals(0, rejected.get());
+        assertEquals(writers * perWriter, queue.size());
+        assertFalse(queue.offer(new MockLruBlockCache.Mutation(999999, 999999L, true)));
+        queue.discardThrough(59999);
+        assertEquals(60000, queue.size());
+        var drained = new ArrayList<MockLruBlockCache.Mutation>();
+        queue.drainTo(drained, 60000);
+        assertEquals(60000, drained.size());
+        assertEquals(
+                60000, drained.stream().map(MockLruBlockCache.Mutation::key).distinct().count());
+        assertTrue(drained.stream().allMatch(value -> value.version() > 59999));
+        assertEquals(0, queue.size());
+    }
+
+    @Test
+    void ambiguousMutationFailureKeepsLiveNodeGeneration() throws Exception {
+        var cache = new MockLruBlockCache(16);
+        var peer = new Peer();
+        try (var publisher =
+                new KvcmEventPublisher(config(64), cache, "live:1", 128, () -> true, peer)) {
+            publisher.start();
+            until(() -> publisher.status().get("state").equals("READY"));
+            assertEquals(1, peer.events("EVENT_NODE_REGISTER").size());
+            peer.loseMutationAck.set(true);
+            cache.admit(List.of(9L));
+            until(() -> ((Number) publisher.status().get("failures")).longValue() > 0);
+            until(
+                    () ->
+                            publisher.status().get("state").equals("READY")
+                                    && peer.keys.equals(Set.of(9L)));
+            assertEquals(1, peer.events("EVENT_NODE_REGISTER").size());
+            assertTrue(peer.events("EVENT_HEARTBEAT").size() > 0);
+        }
+    }
+
+    @Test
+    void snapshotCooldownKeepsHeartbeatsAndShutdownResponsive() throws Exception {
+        var peer = new Peer();
+        var base = config(64);
+        var cfg =
+                new KvcmEventPublisher.Config(
+                                base.endpoint(),
+                                base.group(),
+                                base.instance(),
+                                base.model(),
+                                64,
+                                16,
+                                5,
+                                30,
+                                80,
+                                500,
+                                5,
+                                50)
+                        .withSnapshotTiming(250, 0, 0);
+        try (var publisher =
+                new KvcmEventPublisher(
+                        cfg, new MockLruBlockCache(8), "paced:1", 128, () -> true, peer)) {
+            publisher.start();
+            until(() -> publisher.status().get("state").equals("READY"));
+            int count = peer.snapshots().size();
+            Thread.sleep(100);
+            assertEquals(count, peer.snapshots().size());
+            assertTrue(peer.events("EVENT_HEARTBEAT").size() >= 2);
+            until(() -> peer.snapshots().size() > count);
         }
     }
 }

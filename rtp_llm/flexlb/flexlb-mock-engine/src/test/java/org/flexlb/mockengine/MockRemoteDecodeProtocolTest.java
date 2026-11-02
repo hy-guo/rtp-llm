@@ -38,7 +38,7 @@ class MockRemoteDecodeProtocolTest {
             @Override
             public StreamObserver<EngineRpcService.GenerateRequestPB> remoteGenerate(
                     StreamObserver<EngineRpcService.GenerateOutputsPB> response) {
-                return new MockRemoteDecodeCall((input, clientId, stopped) -> new MockRemoteDecodeCall.Lease() {
+                return new MockRemoteDecodeCall((input, clientId, stopped, spans) -> new MockRemoteDecodeCall.Lease() {
                     @Override
                     public boolean start(LinkedBlockingQueue<EngineRpcService.GenerateOutputsPB> queue) {
                         outputs = queue;
@@ -139,7 +139,7 @@ class MockRemoteDecodeProtocolTest {
         var received = new java.util.ArrayList<EngineRpcService.GenerateOutputsPB>();
         var error = new CompletableFuture<Throwable>();
         AtomicInteger leases = new AtomicInteger();
-        var call = new MockRemoteDecodeCall((input, client, stopped) -> {
+        var call = new MockRemoteDecodeCall((input, client, stopped, spans) -> {
             leases.incrementAndGet();
             return new MockRemoteDecodeCall.Lease() {
                 public boolean start(LinkedBlockingQueue<EngineRpcService.GenerateOutputsPB> queue) { return true; }

@@ -53,4 +53,25 @@ public class EngineGrpcService {
         }
         return engineGrpcClient.getCacheStatusAsync(ip, grpcPort, request, requestTimeoutMs);
     }
+
+    public CompletableFuture<org.flexlb.dao.master.CacheStatus> getCacheStatusSnapshotAsync(
+            String ip,
+            int grpcPort,
+            WorkerStatus workerStatus,
+            long cacheVersion,
+            long requestTimeoutMs,
+            RoleType roleType) {
+        if (RoleType.VIT.equals(roleType))
+            return getCacheStatusAsync(
+                            ip, grpcPort, workerStatus, cacheVersion, requestTimeoutMs, roleType)
+                    .thenApply(EngineStatusConverter::convertToCacheStatus);
+        var request =
+                EngineRpcService.CacheVersionPB.newBuilder()
+                        .setLatestCacheVersion(cacheVersion)
+                        .setNeedCacheKeys(workerStatus.getRole().requiresCacheKeys())
+                        .build();
+        return engineGrpcClient
+                .getCacheStatusSnapshotAsync(ip, grpcPort, request, requestTimeoutMs)
+                .thenApply(org.flexlb.engine.grpc.CacheStatusMarshaller.Response::status);
+    }
 }

@@ -25,6 +25,9 @@ import java.util.concurrent.atomic.LongAdder;
 
 /** Logical engine quotas; protocol cancellation never waits for an engine worker. */
 final class MockRpcExecutors implements AutoCloseable {
+    private static final Set<String> CONTROL_METHODS = Set.of(
+            "GetWorkerStatus", "GetCacheStatus", "RemoteGenerate", "RemoteLoad",
+            "RemoteFinish", "RemoteFinishNew", "Cancel", "CheckHealth");
     private final ExecutorService control = Executors.newFixedThreadPool(2,
             Thread.ofPlatform().daemon().name("mock-rpc-control-", 0).factory());
     private final ExecutorService callbacks = Executors.newThreadPerTaskExecutor(
@@ -72,9 +75,10 @@ final class MockRpcExecutors implements AutoCloseable {
             Context context = Context.current();
             Status failure = null;
             boolean admitted = false;
+            boolean controlCall = CONTROL_METHODS.contains(call.getMethodDescriptor().getBareMethodName());
             if (closing.get() || stopped.get()) failure = Status.UNAVAILABLE.withDescription("mock RPC runtime stopping");
             else if (context.isCancelled()) failure = Contexts.statusFromCancelled(context);
-            else if (!(admitted = calls.tryAcquire())) failure = Status.RESOURCE_EXHAUSTED
+            else if (!controlCall && !(admitted = calls.tryAcquire())) failure = Status.RESOURCE_EXHAUSTED
                     .withDescription("mock RPC harness per-engine in-flight limit");
             if (failure != null) rejected.increment();
             Admission admission = new Admission(call, context, admitted, failure);
@@ -82,7 +86,29 @@ final class MockRpcExecutors implements AutoCloseable {
             context.addListener(ignored -> admission.cancelled(), Runnable::run);
             if (closing.get() || stopped.get()) admission.close(Status.UNAVAILABLE, new Metadata());
             // Reject through the normal RPC status path, never executor rejection.
-            if (!admitted) return control;
+            if (!admitted) {
+                if (failure != null) return control;
+                return command -> {
+                    callbacksInProgress.incrementAndGet();
+                    try {
+                        control.execute(() -> {
+                            try { command.run(); }
+                            finally {
+                                synchronized (Engine.this) {
+                                    callbacksInProgress.decrementAndGet();
+                                    Engine.this.notifyAll();
+                                }
+                            }
+                        });
+                    } catch (RuntimeException error) {
+                        synchronized (Engine.this) {
+                            callbacksInProgress.decrementAndGet();
+                            Engine.this.notifyAll();
+                        }
+                        throw error;
+                    }
+                };
+            }
             return command -> {
                 callbacksInProgress.incrementAndGet();
                 try { callbacks.execute(() -> {
@@ -96,10 +122,12 @@ final class MockRpcExecutors implements AutoCloseable {
                     // Virtual threads wait without occupying another engine's workers.
                     // Cancelled calls still drain gRPC callbacks, bypassing this quota.
                     while (!admission.closed.get() && !context.isCancelled()) {
-                        if (workers.tryAcquire(10, TimeUnit.MILLISECONDS)) {
+                        if (Thread.interrupted()) throw new InterruptedException();
+                        if (workers.tryAcquire()) {
                             acquired = true;
                             break;
                         }
+                        java.util.concurrent.locks.LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(10));
                     }
                     waiting.decrementAndGet();
                     waitingForWorker = false;

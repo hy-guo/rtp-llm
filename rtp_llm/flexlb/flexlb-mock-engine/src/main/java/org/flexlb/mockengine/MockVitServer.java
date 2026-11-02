@@ -11,6 +11,8 @@ public final class MockVitServer {
         java.nio.file.Path model = null;
         var defaults = MockVitService.Config.defaults();
         int hidden = defaults.hiddenSize(), concurrency = defaults.concurrency(), queue = defaults.queueCapacity();
+        int maxInput = defaults.maxInputBytes(), maxInbound = Math.multiplyExact(maxInput, 2);
+        long maxOutput = defaults.maxOutputBytes();
         long embeddings = defaults.embeddingCacheBytes(), hashes = defaults.hashCacheBytes(), delay = defaults.computeDelayMs();
         for (int i = 0; i < args.length; i += 2) {
             if (i + 1 == args.length) throw new IllegalArgumentException("missing value for " + args[i]);
@@ -23,15 +25,31 @@ public final class MockVitServer {
                 case "--queue-capacity" -> queue = Integer.parseInt(args[i + 1]);
                 case "--embedding-cache-bytes" -> embeddings = Long.parseLong(args[i + 1]);
                 case "--hash-cache-bytes" -> hashes = Long.parseLong(args[i + 1]);
+                case "--max-input-bytes" -> maxInput = Integer.parseInt(args[i + 1]);
+                case "--max-output-bytes" -> maxOutput = Long.parseLong(args[i + 1]);
+                case "--grpc-max-inbound-bytes" -> maxInbound = Integer.parseInt(args[i + 1]);
                 case "--compute-delay-ms" -> delay = Long.parseLong(args[i + 1]);
                 default -> throw new IllegalArgumentException("unknown argument " + args[i]);
             }
         }
-        var service = new MockVitService(new MockVitService.Config(hidden, concurrency, queue, embeddings, hashes,
-                defaults.maxInputBytes(), defaults.maxOutputBytes(), delay),
-                model == null ? null : MockV41Image.Config.fromModel(model));
-        var server = NettyServerBuilder.forPort(port).maxInboundMessageSize(defaults.maxInputBytes() * 2)
-                .addService(service).build().start();
+        var service =
+                new MockVitService(
+                        new MockVitService.Config(
+                                hidden,
+                                concurrency,
+                                queue,
+                                embeddings,
+                                hashes,
+                                maxInput,
+                                maxOutput,
+                                delay),
+                        model == null ? null : MockV41Image.Config.fromModel(model));
+        var server =
+                NettyServerBuilder.forPort(port)
+                        .maxInboundMessageSize(maxInbound)
+                        .addService(service)
+                        .build()
+                        .start();
         if (httpPort < 0 || httpPort > 65535 || httpPort == port) {
             server.shutdownNow();
             service.close();

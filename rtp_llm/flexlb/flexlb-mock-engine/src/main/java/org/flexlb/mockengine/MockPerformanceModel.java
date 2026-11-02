@@ -126,6 +126,7 @@ final class MockPerformanceModel {
     private MockEosModel eosModel;
     private volatile MockEosModel runtimeEosModel;
     boolean nativeTokenCacheKeys;
+    Long modelCacheKeyHashSeed;
     boolean prefillReuseCache = true;
     boolean prefillDeviceCache = true;
     private final double sleepScale;
@@ -308,6 +309,7 @@ final class MockPerformanceModel {
         copy.prefillReserveBlockRatio = prefillReserveBlockRatio;
         copy.prefillBatchPolicy = prefillBatchPolicy;
         copy.nativeTokenCacheKeys = nativeTokenCacheKeys;
+        copy.modelCacheKeyHashSeed = modelCacheKeyHashSeed;
         copy.prefillReuseCache = prefillReuseCache;
         copy.prefillDeviceCache = prefillDeviceCache;
         copy.overrideFixedPrefillMs = overrideFixedPrefillMs;
@@ -536,6 +538,18 @@ final class MockPerformanceModel {
     }
 
     RequestShape shape(EngineRpcService.GenerateInputPB input, MockLruBlockCache cache) {
+        return shape(input, cache, List.of());
+    }
+
+    RequestShape shape(EngineRpcService.GenerateInputPB input, MockLruBlockCache cache,
+                       List<EngineRpcService.MultimodalCacheSpanPB> spans) {
+        int previousEnd = 0;
+        for (var span : spans) {
+            if (span.getOffset() < previousEnd || span.getRowHashesCount() <= 0
+                    || (long) span.getOffset() + span.getRowHashesCount() > input.getTokenIdsCount())
+                throw new IllegalArgumentException("invalid backend multimodal cache span");
+            previousEnd = Math.addExact(span.getOffset(), span.getRowHashesCount());
+        }
         int inputLen = input.getTokenIdsCount();
         int outputLen = Math.max(1, input.getGenerateConfig().getMaxNewTokens());
         boolean explicitOutputLength = false;
@@ -565,7 +579,10 @@ final class MockPerformanceModel {
             // Publish only complete blocks; partial blocks are not reusable.
             String physical = System.getenv("MOCK_HASH_BLOCK_SIZE");
             int physicalBlockSize = physical == null || physical.isBlank() ? blockSize : Integer.parseInt(physical);
-            blockKeys.addAll(MockImageCacheKeys.routeBlocks(input, physicalBlockSize, blockSize, MockImageCacheKeys.seed(input)));
+            String seedOverride = System.getenv("MOCK_CACHE_KEY_HASH_SEED");
+            blockKeys.addAll(MockImageCacheKeys.routeBlocks(input, physicalBlockSize, blockSize,
+                    (seedOverride != null && !seedOverride.isBlank()) || modelCacheKeyHashSeed == null
+                            ? MockImageCacheKeys.seed(input, spans) : modelCacheKeyHashSeed, spans));
         }
         // hitBlocks carries the RAW prefix-match run length (key count) — the
         // mock key-level cache-hit counter recorded by the engine at this admission hit
@@ -580,8 +597,22 @@ final class MockPerformanceModel {
         MockEosModel activeEos = runtimeEosModel;
         outputLen = (activeEos == null ? eosModel : activeEos)
                 .outputLength(input, Math.max(1, outputLen), explicitOutputLength);
-        return new RequestShape(input, inputLen, outputLen, List.copyOf(blockKeys),
-                hitTokens, hitBlocks, nativeKeys);
+        return new RequestShape(withoutMultimodalPayload(input), inputLen, outputLen, List.copyOf(blockKeys),
+                hitTokens, hitBlocks, nativeKeys, 0, spans);
+    }
+
+    static EngineRpcService.GenerateInputPB withoutMultimodalPayload(
+            EngineRpcService.GenerateInputPB input) {
+        if (!input.hasV41Inputs() && input.getMultimodalInputsCount() == 0) return input;
+        var compact = input.toBuilder();
+        for (int i = 0; i < input.getMultimodalInputsCount(); i++)
+            compact.getMultimodalInputsBuilder(i).clearMultimodalTensor();
+        if (input.hasV41Inputs()) {
+            var typed = compact.getV41InputsBuilder();
+            for (int i = 0; i < typed.getImagesCount(); i++)
+                typed.getImagesBuilder(i).clearPatches();
+        }
+        return compact.build();
     }
 
     void setEosModel(MockEosModel model) {
@@ -880,7 +911,14 @@ final class MockPerformanceModel {
                         int outputLen,
                         List<Long> blockKeys,
                         long hitTokens,
-                        int hitBlocks, boolean nativeKeys, int memoryHitBlocks) {
+                        int hitBlocks, boolean nativeKeys, int memoryHitBlocks,
+                        List<EngineRpcService.MultimodalCacheSpanPB> multimodalSpans) {
+        RequestShape { multimodalSpans = List.copyOf(multimodalSpans); }
+
+        RequestShape(EngineRpcService.GenerateInputPB input, int inputLen, int outputLen,
+                     List<Long> blockKeys, long hitTokens, int hitBlocks, boolean nativeKeys, int memoryHitBlocks) {
+            this(input, inputLen, outputLen, blockKeys, hitTokens, hitBlocks, nativeKeys, memoryHitBlocks, List.of());
+        }
         /** GenerateStream::batchSize(0): beam search starts with one sequence. */
         int prefillSequenceCount() {
             var config = input.getGenerateConfig();
@@ -892,7 +930,7 @@ final class MockPerformanceModel {
 
         RequestShape(EngineRpcService.GenerateInputPB input, int inputLen, int outputLen,
                      List<Long> blockKeys, long hitTokens, int hitBlocks, boolean nativeKeys) {
-            this(input, inputLen, outputLen, blockKeys, hitTokens, hitBlocks, nativeKeys, 0);
+            this(input, inputLen, outputLen, blockKeys, hitTokens, hitBlocks, nativeKeys, 0, List.of());
         }
     }
 

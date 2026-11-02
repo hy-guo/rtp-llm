@@ -39,6 +39,11 @@ public class EngineGrpcClient extends AbstractGrpcClient {
             "flexlb.engine-grpc.connect-timeout-ms";
     public static final String VIT_CACHE_MAX_INBOUND_MESSAGE_BYTES_PROPERTY =
             "flexlb.engine-grpc.vit-cache-max-inbound-message-bytes";
+    public static final String CACHE_MAX_INBOUND_MESSAGE_BYTES_PROPERTY =
+            "flexlb.engine-grpc.cache-max-inbound-message-bytes";
+    @Value("${" + CACHE_MAX_INBOUND_MESSAGE_BYTES_PROPERTY + ":67108864}")
+    private int cacheMaxInboundMessageBytes = 64 * 1024 * 1024;
+
     private static final int DEFAULT_MAX_INBOUND_MESSAGE_BYTES = 8 * 1024 * 1024;
     private static final int DEFAULT_VIT_CACHE_MAX_INBOUND_MESSAGE_BYTES = 16 * 1024 * 1024;
 
@@ -134,6 +139,9 @@ public class EngineGrpcClient extends AbstractGrpcClient {
                     if (response instanceof MessageLite messageLite) {
                         responseSize = messageLite.getSerializedSize();
                     }
+                    if (response instanceof CacheStatusMarshaller.Response snapshot) {
+                        responseSize = snapshot.serializedSize();
+                    }
                     long duration = TimeUnit.NANOSECONDS.toMillis(endTime - startTime);
                     grpcReporter.reportCallMetrics(
                             serviceType.getOperationName(), duration, responseSize, false);
@@ -197,6 +205,9 @@ public class EngineGrpcClient extends AbstractGrpcClient {
                     if (response instanceof MessageLite messageLite) {
                         responseSize = messageLite.getSerializedSize();
                     }
+                    if (response instanceof CacheStatusMarshaller.Response snapshot) {
+                        responseSize = snapshot.serializedSize();
+                    }
                     long duration = TimeUnit.NANOSECONDS.toMillis(endTime - originalStartTime);
                     grpcReporter.reportCallMetrics(
                             serviceType.getOperationName(), duration, responseSize, true);
@@ -237,7 +248,15 @@ public class EngineGrpcClient extends AbstractGrpcClient {
      * Get cache status via gRPC (async)
      */
     public CompletableFuture<EngineRpcService.CacheStatusPB> getCacheStatusAsync(String ip, int port, EngineRpcService.CacheVersionPB request, long requestTimeoutMs) {
-        return executeGrpcCallAsync(ip, port, stub -> stub.getRpcServiceFutureStub().getCacheStatus(request), requestTimeoutMs, ServiceType.CACHE_STATUS);
+        return executeGrpcCallAsync(ip, port, stub -> stub.getRpcServiceFutureStub()
+                .withMaxInboundMessageSize(cacheMaxInboundMessageBytes).getCacheStatus(request), requestTimeoutMs, ServiceType.CACHE_STATUS);
+    }
+
+    public CompletableFuture<CacheStatusMarshaller.Response> getCacheStatusSnapshotAsync(
+            String ip, int port, EngineRpcService.CacheVersionPB request, long requestTimeoutMs) {
+        return executeGrpcCallAsync(ip, port,
+                stub -> CacheStatusMarshaller.call(stub.getRpcServiceFutureStub(), request, cacheMaxInboundMessageBytes),
+                requestTimeoutMs, ServiceType.CACHE_STATUS);
     }
 
     /**

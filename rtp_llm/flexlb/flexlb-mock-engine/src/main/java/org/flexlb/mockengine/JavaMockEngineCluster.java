@@ -118,7 +118,10 @@ public final class JavaMockEngineCluster {
             System.err.println("KVCM event publishing disabled: invalid configuration (see KVCM event documentation)");
         }
         KvcmEventPublisher.Config publisherConfig = kvcmConfig;
+        MockV41Image.Config multimodalModel = config.modelPath == null ? null
+                : MockV41Image.Config.fromModel(Path.of(config.modelPath));
         config.engineInitializer = service -> {
+            service.configureMultimodalModel(multimodalModel);
             configureWhaleMetrics(service, whaleMonitor);
             if (publisherConfig != null) service.enableKvcm(publisherConfig);
         };
@@ -620,6 +623,11 @@ public final class JavaMockEngineCluster {
         volatile MockCacheDiagnostics cacheDiagnostics;
         private final MockVitClient vitClient = new MockVitClient();
 
+        void configureMultimodalModel(MockV41Image.Config model) {
+            vitClient.configureV41(model);
+            if (model != null) performance.modelCacheKeyHashSeed = MockImageCacheKeys.v41Seed();
+        }
+
         boolean isDiagnosticPrefill() { return roleType == EngineRpcService.RoleTypePB.ROLE_TYPE_PREFILL; }
 
         Set<Long> diagnosticResidentKeys() {
@@ -628,8 +636,13 @@ public final class JavaMockEngineCluster {
             return keys;
         }
 
-        private static Map<Integer, Integer> multimodalLengths(EngineRpcService.GenerateInputPB input) {
+        private static Map<Integer, Integer> multimodalLengths(MockPerformanceModel.RequestShape shape) {
+            var input = shape.input();
             Map<Integer, Integer> lengths = new java.util.HashMap<>();
+            if (!shape.multimodalSpans().isEmpty()) {
+                lengths.put(1, shape.multimodalSpans().stream().mapToInt(EngineRpcService.MultimodalCacheSpanPB::getRowHashesCount).sum());
+                return lengths;
+            }
             if (input.hasV41Inputs()) {
                 int rows = input.getV41Inputs().getImagesList().stream().mapToInt(EngineRpcService.V41ImageInputPB::getTypesCount).sum();
                 if (rows > 0) lengths.put(1, rows);
@@ -710,7 +723,7 @@ public final class JavaMockEngineCluster {
                     }
                     var fresh = new MockPerformanceModel.RequestShape(old.input(), old.inputLen(), old.outputLen(),
                             old.blockKeys(), Math.min((long) (gpu + host) * seqSizePerBlock, old.inputLen()),
-                            gpu + host, old.nativeKeys(), host);
+                            gpu + host, old.nativeKeys(), host, old.multimodalSpans());
                     prepared.add(new BatchMember(fresh, member.batchId(), member.dpRank()));
                 }
             }
@@ -784,7 +797,7 @@ public final class JavaMockEngineCluster {
             int total = gpu + host;
             return new MockPerformanceModel.RequestShape(shape.input(), shape.inputLen(), shape.outputLen(),
                     shape.blockKeys(), Math.min((long) total * seqSizePerBlock, shape.inputLen()),
-                    total, shape.nativeKeys(), host);
+                    total, shape.nativeKeys(), host, shape.multimodalSpans());
         }
 
         private String whalePodIp;
@@ -867,7 +880,7 @@ public final class JavaMockEngineCluster {
                                     responseQueues.remove(id);
                                     finishRequest(id);
                                 }
-                            }));
+                            }), shape.multimodalSpans());
                 }
                 Context preparation = Context.current();
                 Context.CancellationListener stop = ignored -> owner.stream.close();
@@ -941,14 +954,15 @@ public final class JavaMockEngineCluster {
         }
 
         private MockRemoteDecodeCall.Lease allocateRemoteDecode(
-                EngineRpcService.GenerateInputPB input, String clientId, Runnable stoppedCallback) {
+                EngineRpcService.GenerateInputPB input, String clientId, Runnable stoppedCallback,
+                List<EngineRpcService.MultimodalCacheSpanPB> spans) {
             if (!supportsSingleSequence(input))
                 throw io.grpc.Status.UNIMPLEMENTED.withDescription("mock supports only single-sequence output")
                         .asRuntimeException();
             long id = input.getRequestId();
             Object owner = new Object();
             beginRequest(input);
-            MockPerformanceModel.RequestShape shape = performance.shape(input, cache);
+            MockPerformanceModel.RequestShape shape = performance.shape(input, cache, spans);
             synchronized (decodeQueueLock) {
                 if (stopped || shuttingDown || runningTasks.containsKey(id)
                         || cancelledRequests.containsKey(id)
@@ -1802,16 +1816,19 @@ public final class JavaMockEngineCluster {
                                 continue;
                             }
                             EngineRpcService.GenerateInputPB preparedInput = input.getInput();
+                            List<EngineRpcService.MultimodalCacheSpanPB> mediaSpans = List.of();
                             if (isDiagnosticPrefill() && (preparedInput.getMultimodalInputsCount() > 0 || preparedInput.hasV41Inputs())) {
                                 try {
-                                    preparedInput = vitClient.prepare(preparedInput, beginRequest(preparedInput).remainingMs());
+                                    var prepared = vitClient.prepareRequest(preparedInput, beginRequest(preparedInput).remainingMs());
+                                    preparedInput = prepared.input();
+                                    mediaSpans = prepared.spans();
                                 } catch (RuntimeException error) {
                                     response.addErrorsBuilder().setRequestId(requestId).setErrorInfo(MockRpcErrors.downstream(error));
                                     requestStates.put(requestId, "rejected");
                                     continue;
                                 }
                             }
-                            MockPerformanceModel.RequestShape shape = matchPrefillMemory(performance.shape(preparedInput, cache));
+                            MockPerformanceModel.RequestShape shape = matchPrefillMemory(performance.shape(preparedInput, cache, mediaSpans));
                             observeCacheDiagnostics(shape);
                             // Key-level cache-hit accounting at the admission hit
                             // computation point (recorded whether or not the request
@@ -2253,11 +2270,16 @@ public final class JavaMockEngineCluster {
 
             long requestId = request.getRequestId();
             beginRequest(request);
+            List<EngineRpcService.MultimodalCacheSpanPB> mediaSpans = List.of();
             if (isDiagnosticPrefill() && (request.getMultimodalInputsCount() > 0 || request.hasV41Inputs())) {
-                try { vitClient.prepare(request, beginRequest(request).remainingMs()); }
+                try {
+                    var prepared = vitClient.prepareRequest(request, beginRequest(request).remainingMs());
+                    request = prepared.input();
+                    mediaSpans = prepared.spans();
+                }
                 catch (RuntimeException error) { finishRequest(request.getRequestId()); observer.onError(error); return; }
             }
-            MockPerformanceModel.RequestShape shape = matchPrefillMemory(performance.shape(request, cache));
+            MockPerformanceModel.RequestShape shape = matchPrefillMemory(performance.shape(request, cache, mediaSpans));
             observeCacheDiagnostics(shape);
             // Key-level cache-hit accounting (direct path, same admission hit
             // computation point as the enqueue-batch path above).
@@ -3529,7 +3551,7 @@ public final class JavaMockEngineCluster {
                     int hits = performance.prefillDeviceCache ? cache.prefixHitBlocks(reusableKeys(queued, false)) : 0;
                     var current = matchPrefillMemory(new MockPerformanceModel.RequestShape(queued.input(), queued.inputLen(),
                             queued.outputLen(), queued.blockKeys(),
-                            Math.min((long) hits * performance.blockSize(), queued.inputLen()), hits, queued.nativeKeys()));
+                            Math.min((long) hits * performance.blockSize(), queued.inputLen()), hits, queued.nativeKeys(), 0, queued.multimodalSpans()));
                     if (!budget.fits(current.inputLen(), current.hitTokens(), current.prefillSequenceCount())) return null;
                     // An initialized waiter owns its existing blocks. Do not
                     // allocate a second lease and overwrite the first one.
@@ -4404,9 +4426,9 @@ public final class JavaMockEngineCluster {
                 FastRpcService decode, MockPerformanceModel.RequestShape shape) {
             if (!shape.nativeKeys() || seqSizePerBlock == decode.seqSizePerBlock) return shape;
             // The local bundle transfers tokens, not the P allocator's block layout.
-            var local = decode.performance.shape(shape.input(), decode.cache);
+            var local = decode.performance.shape(shape.input(), decode.cache, shape.multimodalSpans());
             return new MockPerformanceModel.RequestShape(shape.input(), shape.inputLen(),
-                    shape.outputLen(), local.blockKeys(), local.hitTokens(), local.hitBlocks(), true);
+                    shape.outputLen(), local.blockKeys(), local.hitTokens(), local.hitBlocks(), true, 0, shape.multimodalSpans());
         }
 
         private boolean allocateDecodeSession(FastRpcService decode, MockPrefillSession session) {
@@ -5346,7 +5368,7 @@ public final class JavaMockEngineCluster {
                     .addFinished(finished)
                     .addAuxInfo(EngineRpcService.AuxInfoPB.newBuilder()
                             .setInputLen(shape.inputLen())
-                            .putAllMultimodalLengths(multimodalLengths(shape.input()))
+                            .putAllMultimodalLengths(multimodalLengths(shape))
                             .setPrefixLen((int) shape.hitTokens())
                             .setOutputLen(outputLen)
                             .setIterCount(1)
@@ -7249,6 +7271,7 @@ public final class JavaMockEngineCluster {
         String discoveryFile;
         String performanceFile;
         String masterConfigFile;
+        String modelPath;
         /** Legacy uniform token-capacity knob — applies to BOTH per-role pools when set. */
         long totalKvTokens = DEFAULT_TOTAL_KV_TOKENS;
         /**
@@ -7338,6 +7361,7 @@ public final class JavaMockEngineCluster {
                     case "--discovery-file" -> config.discoveryFile = value;
                     case "--performance" -> config.performanceFile = value;
                     case "--master-config" -> config.masterConfigFile = value;
+                    case "--model-path" -> config.modelPath = value;
                     // --total-kv-tokens stays the uniform knob: sets BOTH
                     // per-role pools (Python compat: one number, both roles).
                     case "--total-kv-tokens" -> {

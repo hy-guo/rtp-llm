@@ -6,8 +6,8 @@ import org.flexlb.metric.FlexMonitor;
 import org.flexlb.metric.MasterStatusProvider;
 import org.flexlb.metric.NoOpFlexMonitor;
 
-import java.util.Map;
 import java.util.HashMap;
+import java.util.Map;
 
 /** Optional internal adapter; no private class is linked by the open-source runtime. */
 final class WhaleMockMonitor implements AutoCloseable {
@@ -115,6 +115,22 @@ final class WhaleMockMonitor implements AutoCloseable {
             }
             monitor.report(name, tags, value.doubleValue());
         });
+        Number age = metrics.get("mock_cache_evicted_entry_age_ms");
+        String scope = labels.get("scope");
+        if (age != null
+                && Double.isFinite(age.doubleValue())
+                && age.doubleValue() >= 0
+                && ("gpu".equals(scope) || "memory".equals(scope))) {
+            String name = "rtp_llm_kv_cache_evicted_block_lifetime_ms";
+            if (registered.add(name)) monitor.register(name, FlexMetricType.GAUGE);
+            Map<String, String> alias = new HashMap<>(labels);
+            alias.put("tier", "gpu".equals(scope) ? "DEVICE" : "HOST");
+            alias.put("group_type", "full");
+            alias.put("trigger_type", "force_drop");
+            alias.put("lifetime_source", "mock_cache_entry");
+            monitor.report(
+                    name, new FlexMetricTags.ImmutableFlexMetricTags(alias), age.doubleValue());
+        }
     }
 
     synchronized void reportScheduler(Map<String, Number> metrics, Map<String, String> labels) {

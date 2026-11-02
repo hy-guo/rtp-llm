@@ -4,14 +4,13 @@ import lombok.extern.slf4j.Slf4j;
 import org.flexlb.cache.domain.DiffResult;
 import org.flexlb.cache.monitor.CacheMetricsReporter;
 import org.flexlb.cache.service.DynamicCacheIntervalService;
+import org.flexlb.collection.LongKeySet;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.util.Collections;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ForkJoinPool;
-import java.util.concurrent.ForkJoinTask;
 
 /**
  * Engine local view (small hash table)
@@ -28,11 +27,6 @@ public class EngineLocalView {
      * Core storage structure: EngineIpPort -> Set<Long>
      */
     private final ConcurrentHashMap<String, Set<Long>> engineViews = new ConcurrentHashMap<>();
-
-    /**
-     * Custom ForkJoin thread pool for parallel computation
-     */
-    private final ForkJoinPool customPool = new ForkJoinPool(Math.min(Runtime.getRuntime().availableProcessors(), 8));
 
     /**
      * Cache metrics reporter
@@ -62,24 +56,10 @@ public class EngineLocalView {
         Set<Long> oldCacheBlocks = getEngineCacheBlocks(engineIPort);
 
         // Efficiently calculate differences
-        Set<Long> addedBlocks = ConcurrentHashMap.newKeySet(128);
-        Set<Long> removedBlocks = ConcurrentHashMap.newKeySet(128);
-
-        // Use custom ForkJoin thread pool to parallel compute added and removed cache blocks
-        ForkJoinTask<?> addedTask = customPool.submit(() ->
-            newCacheBlocks.parallelStream()
-                 .filter(blockCacheKey -> !oldCacheBlocks.contains(blockCacheKey))
-                 .forEach(addedBlocks::add)
-        );
-
-        ForkJoinTask<?> removedTask = customPool.submit(() ->
-            oldCacheBlocks.parallelStream()
-                .filter(blockCacheKey -> !newCacheBlocks.contains(blockCacheKey))
-                .forEach(removedBlocks::add)
-        );
-
-        addedTask.join();
-        removedTask.join();
+        Set<Long> addedBlocks = new LongKeySet();
+        Set<Long> removedBlocks = new LongKeySet();
+        collectDifference(newCacheBlocks, oldCacheBlocks, addedBlocks);
+        collectDifference(oldCacheBlocks, newCacheBlocks, removedBlocks);
 
         cacheMetricsReporter.reportCacheDiffMetrics(role, addedBlocks.size(), removedBlocks.size());
 
@@ -96,6 +76,17 @@ public class EngineLocalView {
 
     }
 
+    private static void collectDifference(Set<Long> source, Set<Long> excluded, Set<Long> output) {
+        if (source instanceof LongKeySet keys
+                && excluded instanceof LongKeySet other
+                && output instanceof LongKeySet result) {
+            keys.forEachLong(
+                    key -> {
+                        if (!other.containsLong(key)) result.addLong(key);
+                    });
+        } else for (Long key : source) if (!excluded.contains(key)) output.add(key);
+    }
+
     /**
      * Add or update engine cache block
      *
@@ -107,7 +98,7 @@ public class EngineLocalView {
             log.warn("Invalid parameters: engineIPort={}, blockCacheKey={}", engineIPort, blockCacheKey);
             return;
         }
-        Set<Long> engineCache = engineViews.computeIfAbsent(engineIPort, k -> ConcurrentHashMap.newKeySet());
+        Set<Long> engineCache = engineViews.computeIfAbsent(engineIPort, k -> new LongKeySet());
 
         engineCache.add(blockCacheKey);
     }

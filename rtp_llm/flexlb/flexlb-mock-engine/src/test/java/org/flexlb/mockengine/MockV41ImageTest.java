@@ -1,12 +1,16 @@
 package org.flexlb.mockengine;
 
+import static org.junit.jupiter.api.Assertions.*;
+
 import com.google.protobuf.ByteString;
+
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.Server;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import io.grpc.netty.NettyServerBuilder;
+
 import org.flexlb.engine.grpc.EngineRpcService;
 import org.flexlb.engine.grpc.MultimodalRpcServiceGrpc;
 import org.junit.jupiter.api.Test;
@@ -16,8 +20,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
-
-import static org.junit.jupiter.api.Assertions.*;
 
 class MockV41ImageTest {
     static final String IDENTITY = "3c4495a0bb9a965190d72f80205fa78d38d66c9a7bcefd5d5ff38fa795683f12";
@@ -44,11 +46,13 @@ class MockV41ImageTest {
                 .build();
     }
     @Test void modelMetadataIdentityMatchesRealPythonProcessor(@TempDir Path model) throws Exception {
-        Files.writeString(model.resolve("config.json"), """
-                {"text_config":{"hidden_size":8,"vocab_size":129280,"max_position_embeddings":1048576},
-                 "vision_config":{"patch_size":14,"downsample_ratio":3,"max_image_tokens":1024,"min_pixels":295936},
-                 "image_token_id":129264}
-                """);
+        Files.writeString(
+                model.resolve("config.json"),
+                """
+{"text_config":{"hidden_size":8,"vocab_size":129280,"max_position_embeddings":1048576},
+ "vision_config":{"patch_size":14,"downsample_ratio":3,"max_image_tokens":1024,"min_pixels":295936},
+ "image_token_id":129264}
+""");
         assertEquals(config(), MockV41Image.Config.fromModel(model));
     }
     @Test void typedValidationRejectsWrongProcessorGeometryAndPatchShapeBeforeForward() {
@@ -112,5 +116,27 @@ class MockV41ImageTest {
         assertEquals(3, MockImageCacheKeys.validHitBlocks(a, 3, 2));
         var noIdentity = input(image(""), 1);
         assertEquals(List.of(), MockImageCacheKeys.fullBlocks(noIdentity, 2, 0));
+    }
+
+    @Test
+    void computedRequestShapeRetainsImageMetadataWithoutPixelPayload(@TempDir Path directory)
+            throws Exception {
+        var original = input(image("a".repeat(64)), 1);
+        var model = MockEngineTestSupport.performanceModel(directory, "10", 1);
+        var shape = model.shape(original, new MockLruBlockCache(128));
+        assertEquals(original.getTokenIdsList(), shape.input().getTokenIdsList());
+        assertEquals(original.getGenerateConfig(), shape.input().getGenerateConfig());
+        var descriptor = shape.input().getV41Inputs().getImages(0);
+        assertFalse(descriptor.hasPatches());
+        assertEquals(
+                original.getV41Inputs().getImages(0).getTypesList(), descriptor.getTypesList());
+        assertEquals(
+                original.getV41Inputs().getImages(0).getContentSha256(),
+                descriptor.getContentSha256());
+        assertEquals(
+                original.getV41Inputs().getTokenTypesList(),
+                shape.input().getV41Inputs().getTokenTypesList());
+        assertEquals(original.getTokenIdsCount(), shape.inputLen());
+        assertTrue(original.getV41Inputs().getImages(0).hasPatches());
     }
 }

@@ -223,6 +223,28 @@ class TestMultiModalUtil(unittest.TestCase):
 
         self.assertEqual(request_impl.call_count, 3)
 
+    def test_request_deadline_bounds_each_configured_timeout(self):
+        for configured, remaining, expected in [
+            ((5, 20), 60, (5, 20)),
+            ((5, 20), 2, (2, 2)),
+            ((None, 20), 2, (2, 2)),
+            (30, 60, 30),
+            (None, 60, 10),
+        ]:
+            implementation = Mock(return_value=_FakeResponse())
+            with patch(
+                "rtp_llm.multimodal.multimodal_util.REQUEST_GET", implementation
+            ), patch(
+                "rtp_llm.multimodal.multimodal_util.time.monotonic", return_value=100
+            ):
+                request_get(
+                    "https://example.com/image",
+                    {},
+                    timeout=configured,
+                    deadline=100 + remaining,
+                )
+            self.assertEqual(implementation.call_args.kwargs["timeout"], expected)
+
     def test_request_get_does_not_retry_read_timeout(self):
         request_impl = Mock(side_effect=requests.exceptions.ReadTimeout())
         with patch("rtp_llm.multimodal.multimodal_util.REQUEST_GET", request_impl):

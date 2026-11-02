@@ -57,6 +57,12 @@ final class MockVitImage {
 
     static Result compute(EngineRpcService.MultimodalInputPB input, int hiddenSize,
                           int maxInputBytes, long maxOutputBytes, long timeoutMs) throws Exception {
+        BufferedImage image = decode(input, maxInputBytes, timeoutMs);
+        return qwenForward(input, image, hiddenSize, maxOutputBytes);
+    }
+
+    static BufferedImage decode(EngineRpcService.MultimodalInputPB input, int maxInputBytes,
+                                long timeoutMs) throws Exception {
         if (input.getMultimodalType() != 1) throw new IllegalArgumentException("Mock ViT currently supports IMAGE only");
         if (input.getMultimodalTensor().getSerializedSize() != 0)
             throw new IllegalArgumentException("Mock ViT requires URL images, not preprocessed tensors");
@@ -96,6 +102,11 @@ final class MockVitImage {
                 image = reader.read(0);
             } finally { reader.dispose(); }
         }
+        return image;
+    }
+
+    private static Result qwenForward(EngineRpcService.MultimodalInputPB input, BufferedImage image,
+                                      int hiddenSize, long maxOutputBytes) throws Exception {
         var p = input.getMmPreprocessConfig();
         int minPixels = p.getMinPixels() > 0 ? p.getMinPixels() : 4 * 28 * 28;
         int maxPixels = p.getMaxPixels() > 0 ? p.getMaxPixels() : 16384 * 28 * 28;

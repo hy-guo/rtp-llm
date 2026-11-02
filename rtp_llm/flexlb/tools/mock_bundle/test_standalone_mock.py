@@ -35,6 +35,7 @@ class StandaloneMockTest(unittest.TestCase):
                             ("--unique-engine-ips", "false"),
                             ("--auto-fetch", "false"), ("--kmonitor", "true"),
                             ("--cache-status-compact-encoding", "false"),
+                            ("--grpc-max-inbound-message-bytes", "2147483647"),
                             ("--prefill-kv-pool-blocks", "113282"),
                             ("--decode-kv-pool-blocks", "113282")):
             self.assertEqual(args[args.index(flag) + 1], value)
@@ -58,6 +59,17 @@ class StandaloneMockTest(unittest.TestCase):
         self.env["MOCK_CACHE_STATUS_COMPACT_ENCODING"] = "1"
         args = standalone_mock.command(self.env)
         self.assertEqual(args[args.index("--cache-status-compact-encoding") + 1], "true")
+
+    def test_model_metadata_reaches_both_prefill_and_decode_without_frontend_patch(self):
+        model = Path(self.directory.name) / "checkpoint"
+        model.mkdir()
+        (model / "config.json").write_text('{"image_token_id": 129264}')
+        for role, counts in (("PREFILL", ("1", "0")), ("DECODE", ("0", "1"))):
+            with self.subTest(role=role):
+                args = standalone_mock.command({**self.env, "ROLE_TYPE": role,
+                    "MOCK_DEPLOYMENT_MODE": "per_engine", "CHECKPOINT_PATH": str(model),
+                    "MOCK_PREFILL_COUNT": counts[0], "MOCK_DECODE_COUNT": counts[1]})
+                self.assertEqual(args[args.index("--model-path") + 1], str(model))
 
     def test_fetch_is_independent_of_placement(self):
         for mode, counts in (("single_pod", {"MOCK_PREFILL_COUNT": "2", "MOCK_DECODE_COUNT": "3"}),

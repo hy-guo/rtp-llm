@@ -25,7 +25,11 @@ def command(env):
             "-Djava.awt.headless=true", "-cp", str(jar), "org.flexlb.mockengine.MockVitServer",
             "--http-port", str(port), "--port", str(port + 1), "--model-path", str(model),
             "--concurrency", env.get("VIT_MAX_CONCURRENT_REQUESTS", "32"),
-            "--embedding-cache-bytes", env.get("MOCK_VIT_CACHE_BYTES", "0")]
+            "--queue-capacity", env.get("MOCK_VIT_QUEUE_CAPACITY", "2048"),
+            "--embedding-cache-bytes", env.get("MOCK_VIT_CACHE_BYTES", "0"),
+            "--max-input-bytes", env.get("MOCK_VIT_MAX_INPUT_BYTES", str(512 << 20)),
+            "--max-output-bytes", env.get("MOCK_VIT_MAX_OUTPUT_BYTES", str(512 << 20)),
+            "--grpc-max-inbound-bytes", env.get("MOCK_VIT_GRPC_MAX_INBOUND_BYTES", str(1024 << 20))]
 
 
 if __name__ == "__main__":

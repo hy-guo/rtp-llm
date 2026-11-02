@@ -11,23 +11,37 @@ final class MockImageCacheKeys {
         return hash ^ ((long)word + 0x9e3779b97f4a7c15L + (hash << 12) + (hash >> 32));
     }
     static long seed(EngineRpcService.GenerateInputPB input) {
+        return seed(input, List.of());
+    }
+    static long seed(EngineRpcService.GenerateInputPB input, List<EngineRpcService.MultimodalCacheSpanPB> spans) {
         String override = System.getenv("MOCK_CACHE_KEY_HASH_SEED");
         if (override != null && !override.isBlank()) return Long.decode(override);
-        if (!input.hasV41Inputs()) return 0;
+        if (!input.hasV41Inputs() && spans.isEmpty()) return 0;
+        return v41Seed();
+    }
+    static long v41Seed() {
         boolean bounded = "1".equals(System.getenv("DSV41_SWA_BOUNDED_REPLAY"));
         return bounded ? 0x4453563431494231L : 0x4453563431494631L;
     }
     static List<Long> routeBlocks(EngineRpcService.GenerateInputPB input, int physicalBlockSize,
                                  int routeBlockSize, long initialHash) {
+        return routeBlocks(input, physicalBlockSize, routeBlockSize, initialHash, List.of());
+    }
+    static List<Long> routeBlocks(EngineRpcService.GenerateInputPB input, int physicalBlockSize,
+                                 int routeBlockSize, long initialHash, List<EngineRpcService.MultimodalCacheSpanPB> spans) {
         if (physicalBlockSize <= 0 || routeBlockSize <= 0 || routeBlockSize % physicalBlockSize != 0)
             throw new IllegalArgumentException("role block size must be a multiple of physical hash block size");
-        List<Long> physical = fullBlocks(input, physicalBlockSize, initialHash);
+        List<Long> physical = fullBlocks(input, physicalBlockSize, initialHash, spans);
         int stride = routeBlockSize / physicalBlockSize;
         List<Long> result = new ArrayList<>();
         for (int i = stride - 1; i < physical.size(); i += stride) result.add(physical.get(i));
         return List.copyOf(result);
     }
     static List<Long> fullBlocks(EngineRpcService.GenerateInputPB input, int blockSize, long initialHash) {
+        return fullBlocks(input, blockSize, initialHash, List.of());
+    }
+    static List<Long> fullBlocks(EngineRpcService.GenerateInputPB input, int blockSize, long initialHash,
+                                 List<EngineRpcService.MultimodalCacheSpanPB> spans) {
         List<Long> keys = new ArrayList<>();
         long hash = initialHash;
         int trustedLength = input.getTokenIdsCount();
@@ -36,6 +50,15 @@ final class MockImageCacheKeys {
                 trustedLength = Math.min(trustedLength, image.getStart());
         for (int begin = 0; begin + blockSize <= trustedLength; begin += blockSize) {
             for (int i = begin; i < begin + blockSize; i++) hash = combine(hash, input.getTokenIds(i));
+            // CompleteTokenIds::multimodalCacheIdentity in the generic backend.
+            for (var span : spans) {
+                int start = span.getOffset(), end = Math.addExact(start, span.getRowHashesCount());
+                int overlapStart = Math.max(begin, start), overlapEnd = Math.min(begin + blockSize, end);
+                if (overlapStart >= overlapEnd) continue;
+                for (int word : new int[] {-42, overlapStart - begin, span.getRowHashesCount(),
+                        overlapStart - start, overlapEnd - overlapStart}) hash = combine(hash, word);
+                for (int i = overlapStart - start; i < overlapEnd - start; i++) hash = combine(hash, span.getRowHashes(i));
+            }
             if (input.hasV41Inputs()) for (var image : input.getV41Inputs().getImagesList()) {
                 int start = image.getStart(), end = Math.addExact(start, image.getTypesCount());
                 if (end <= begin || start >= begin + blockSize) continue;

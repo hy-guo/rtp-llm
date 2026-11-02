@@ -19,7 +19,10 @@ class PerEngineRolesTest(unittest.TestCase):
             args = vit.command(env)
         prepare.assert_called_once()
         for key, value in (("--http-port", "22160"), ("--port", "22161"),
-                           ("--model-path", "/model"), ("--concurrency", "3")):
+                           ("--model-path", "/model"), ("--concurrency", "3"),
+                           ("--queue-capacity", "2048"), ("--max-input-bytes", str(512 << 20)),
+                           ("--max-output-bytes", str(512 << 20)),
+                           ("--grpc-max-inbound-bytes", str(1024 << 20))):
             self.assertEqual(args[args.index(key) + 1], value)
 
     def test_vit_rejects_role_model_and_port_errors_before_start(self):

@@ -37,6 +37,14 @@ final class MockRemoteDecodeStream implements AutoCloseable {
                            String clientId, long deadlineMs,
                            Consumer<EngineRpcService.GenerateOutputsPB> output,
                            Consumer<Throwable> failure, Runnable completed) {
+        this(channel, input, clientId, deadlineMs, output, failure, completed, java.util.List.of());
+    }
+
+    MockRemoteDecodeStream(Channel channel, EngineRpcService.GenerateInputPB input,
+                           String clientId, long deadlineMs,
+                           Consumer<EngineRpcService.GenerateOutputsPB> output,
+                           Consumer<Throwable> failure, Runnable completed,
+                           java.util.List<EngineRpcService.MultimodalCacheSpanPB> spans) {
         if (deadlineMs < 0) throw new IllegalArgumentException("negative RemoteGenerate deadline");
         this.requestId = input.getRequestId();
         this.clientId = clientId;
@@ -81,7 +89,8 @@ final class MockRemoteDecodeStream implements AutoCloseable {
                 });
         request.onNext(EngineRpcService.GenerateRequestPB.newBuilder()
                 .setStage(EngineRpcService.RemoteStage.ALLOCATE)
-                .setRequestId(requestId).setClientId(clientId).setInput(input).build());
+                .setRequestId(requestId).setClientId(clientId).setInput(input)
+                .addAllMultimodalCacheSpans(spans).build());
         } finally {
             leaseContext.detach(previous);
         }

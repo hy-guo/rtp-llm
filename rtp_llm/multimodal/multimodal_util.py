@@ -105,11 +105,16 @@ def request_get(url, headers, timeout=None, *, deadline=None, cancellation_event
         _check_download(deadline, cancellation_event)
         try:
             if deadline is not None:
-                return REQUEST_GET(
-                    url,
-                    headers,
-                    timeout=max(0.001, min(10, deadline - time.monotonic())),
-                )
+                remaining = max(0.001, deadline - time.monotonic())
+                configured = 10 if timeout is None else timeout
+                if isinstance(configured, tuple):
+                    effective_timeout = tuple(
+                        remaining if value is None else min(value, remaining)
+                        for value in configured
+                    )
+                else:
+                    effective_timeout = min(configured, remaining)
+                return REQUEST_GET(url, headers, timeout=effective_timeout)
             if timeout is not None:
                 return REQUEST_GET(url, headers, timeout=timeout)
             return REQUEST_GET(url, headers)

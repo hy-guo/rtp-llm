@@ -95,8 +95,9 @@ public final class MockVitService extends MultimodalRpcServiceGrpc.MultimodalRpc
     }
 
     CompletableFuture<MockVitImage.Result> acquire(EngineRpcService.MultimodalInputPB image, long timeoutMs) {
-        return acquire(MockVitImage.key(image), timeoutMs, () -> MockVitImage.compute(image, config.hiddenSize(),
-                config.maxInputBytes(), config.maxOutputBytes(), timeoutMs));
+        return acquire(MockVitImage.key(image), timeoutMs, () -> v41 == null
+                ? MockVitImage.compute(image, config.hiddenSize(), config.maxInputBytes(), config.maxOutputBytes(), timeoutMs)
+                : MockV41Image.compute(image, v41, config.maxInputBytes(), config.maxOutputBytes(), timeoutMs));
     }
 
     private CompletableFuture<MockVitImage.Result> acquire(String key, long timeoutMs,
@@ -279,7 +280,9 @@ public final class MockVitService extends MultimodalRpcServiceGrpc.MultimodalRpc
     }
     @Override public void getWorkerStatus(EngineRpcService.StatusVersionPB request,
                                           StreamObserver<EngineRpcService.WorkerStatusPB> observer) {
-        observer.onNext(EngineRpcService.WorkerStatusPB.newBuilder().setRole("VIT").setStatusVersion(1).setAlive(true).build());
+        observer.onNext(EngineRpcService.WorkerStatusPB.newBuilder().setRole("VIT")
+                .setRoleType(EngineRpcService.RoleTypePB.ROLE_TYPE_VIT).setStatusVersion(1).setAlive(true)
+                .setMmInflightInputs(com.google.protobuf.Int64Value.of(pending.size())).build());
         observer.onCompleted();
     }
     @Override public synchronized void getCacheStatus(EngineRpcService.CacheVersionPB request,

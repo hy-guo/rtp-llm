@@ -22,6 +22,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -203,7 +204,53 @@ class WhaleRemotePrefillTest {
 
     private io.grpc.Server remoteServer;
 
+    @Test
+    @Timeout(30)
+    void genericV41FrontendRunsThroughRemoteDecodeWithMatchingCacheKeys() throws Exception {
+        startCluster("10", 2.0, true);
+        var model = MockGenericV41Test.MODEL;
+        prefill.configureMultimodalModel(model);
+        decode.configureMultimodalModel(model);
+        try (var vit = new MockVitService(MockVitService.Config.defaults(), model)) {
+            var server = io.grpc.ServerBuilder.forPort(0).addService(vit).build().start();
+            try (var client = new MockVitClient()) {
+                var image = MockVitServiceTest.image(47, 31, 0xabcdef);
+                var request = MockGenericV41Test.input(server.getPort(), image, image).toBuilder().setRequestId(9091);
+                // Cross at least one physical KV block after image expansion.
+                for (int i = 0; i < 1100; i++) request.addTokenIds(i);
+                request.getGenerateConfigBuilder().setReuseCache(true).setEnableDeviceCache(true)
+                        .addRoleAddrs(EngineRpcService.RoleAddrPB.newBuilder()
+                        .setRole(EngineRpcService.RoleAddrPB.RoleType.DECODE).setIp("127.0.0.1")
+                        .setGrpcPort(decode.getGrpcPort()));
+                client.configureV41(model);
+                var prepared = client.prepareRequest(request.build(), 5000);
+                var expected = MockImageCacheKeys.routeBlocks(prepared.input(), 1024, 1024,
+                        MockImageCacheKeys.v41Seed(), prepared.spans());
+                assertFalse(expected.isEmpty());
+                var ack = enqueue(prefill, batch(9091, slot(0, request.build())));
+                assertEquals(0, ack.getErrorsCount());
+                assertEquals(1, ack.getSuccessesCount());
+                var stream = fetch(prefill, 9091, 10_000);
+                assertNull(stream.error.get());
+                assertEquals(4, stream.frames.size());
+                var output = stream.frames.getLast().getFlattenOutput();
+                assertTrue(output.getFinished(0));
+                assertEquals(prepared.input().getTokenIdsCount(), output.getAuxInfo(0).getInputLen());
+                assertEquals(378, output.getAuxInfo(0).getMultimodalLengthsOrDefault(1, 0));
+                assertTrue(prefill.diagnosticResidentKeys().containsAll(expected));
+                assertTrue(decode.diagnosticResidentKeys().containsAll(expected),
+                        "D must retain the backend hash sidecar across RemoteGenerate ALLOCATE");
+            } finally {
+                server.shutdownNow().awaitTermination(3, TimeUnit.SECONDS);
+            }
+        }
+    }
+
     private void startCluster(String prefillFormulaMs, double decodeStepMs) throws IOException {
+        startCluster(prefillFormulaMs, decodeStepMs, false);
+    }
+
+    private void startCluster(String prefillFormulaMs, double decodeStepMs, boolean nativeKeys) throws IOException {
         Path performance = tempDir.resolve("performance-" + System.nanoTime() + ".json");
         Path master = tempDir.resolve("master-" + System.nanoTime() + ".json");
         new com.fasterxml.jackson.databind.ObjectMapper().writeValue(performance.toFile(), Map.of(
@@ -216,6 +263,7 @@ class WhaleRemotePrefillTest {
                         "step_ms_by_batch", List.of(List.of(1, decodeStepMs)))));
         MockMasterConfig.writeWithPrefillExpression(master, prefillFormulaMs);
         MockPerformanceModel model = MockPerformanceModel.load(performance.toString(), master.toString());
+        model.nativeTokenCacheKeys = nativeKeys;
 
         prefill = new JavaMockEngineCluster.FastRpcService(
                 "prefill", EngineRpcService.RoleTypePB.ROLE_TYPE_PREFILL,

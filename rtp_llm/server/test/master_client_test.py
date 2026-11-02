@@ -287,6 +287,20 @@ class MasterClientBatchPayloadTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response.is_ok)
         self.assertEqual(client.calls[0]["request_pb"].priority, 50)
 
+    async def test_vit_route_cap_preserves_stricter_request_deadline(self):
+        for request_ms, supplied, expected in [
+            (30000, None, 5.0),
+            (700, None, 0.7),
+            (30000, 0.2, 0.2),
+        ]:
+            client = _CaptureMasterClient()
+            request = _FakeInput()
+            request.generate_config.ttft_timeout_ms = request_ms
+            await client.get_backend_role_addrs(
+                [], 1024, request, 99, vit_only=True, timeout_s=supplied
+            )
+            self.assertEqual(client.calls[0]["timeout_s"], expected)
+
     async def test_schedule_deadline_does_not_retry_slave(self):
         client = _DeadlineMasterClient()
 

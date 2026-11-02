@@ -37,7 +37,8 @@ class KvcmRealParityTest {
     }
     static KvcmEventPublisher.Config config(URI uri, List<KvcmEventPublisher.Group> groups) {
         return new KvcmEventPublisher.Config(uri, "g", "model", "mock", 64, 32, 5, 20,
-                10000, 500, 5, 50, "ST_EVENT_REPORT_L1P5", groups, null, 2000, 300, true);
+                10000, 500, 5, 50, "ST_EVENT_REPORT_L1P5", groups, null, 2000, 300, true)
+                .withSnapshotTiming(0, 0, 0);
     }
     private static final List<KvcmEventPublisher.Group> GROUPS = List.of(
             new KvcmEventPublisher.Group("full0", "FULL", true, 4096),
@@ -104,6 +105,30 @@ class KvcmRealParityTest {
         assertFalse(nested.ok()); assertTrue(nested.registrationRequired());
         assertFalse(KvcmEventPublisher.parseFeedback("{\"header\":{\"status\":{\"code\":1}},\"snapshot_required\":0}").valid());
         assertFalse(KvcmEventPublisher.parseFeedback("{\"header\":{\"status\":{\"code\":1}},\"retry_after_ms\":-1}").valid());
+    }
+    @Test void leaderFailureNeverProvesNodeAbsenceAndMissingNodeRegistersAgain() throws Exception {
+        try (var peer = new Peer()) {
+            var mode = new java.util.concurrent.atomic.AtomicReference<>("OK");
+            var registrations = new AtomicInteger();
+            peer.reply = request -> {
+                if (event(request, "EVENT_NODE_REGISTER")) {
+                    registrations.incrementAndGet(); mode.set("OK");
+                }
+                if (event(request, "EVENT_HEARTBEAT"))
+                    return "{\"header\":{\"status\":{\"code\":\"" + mode.get() + "\"}}}";
+                return OK;
+            };
+            try (var publisher = new KvcmEventPublisher(config(peer.uri(), GROUPS),
+                    new MockLruBlockCache(8), "live:1", 512, () -> true, null)) {
+                publisher.start(); until(() -> publisher.status().get("state").equals("READY"));
+                mode.set("SERVER_NOT_LEADER");
+                until(() -> (long) publisher.status().get("failures") >= 3);
+                assertEquals(1, registrations.get());
+                mode.set("NODE_NOT_REGISTERED");
+                until(() -> registrations.get() == 2 && publisher.status().get("state").equals("READY"));
+                assertTrue(peer.count("EVENT_BLOCK_SNAPSHOT") >= 2);
+            }
+        }
     }
     @Test void slowSnapshotKeepsHeartbeatsAndHostDownIsLast() throws Exception {
         try (var peer = new Peer()) {

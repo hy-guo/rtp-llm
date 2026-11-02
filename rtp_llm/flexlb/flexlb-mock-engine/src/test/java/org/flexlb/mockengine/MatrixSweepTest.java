@@ -80,6 +80,7 @@ class MatrixSweepTest {
 
             // ── Wait for all completions ──
             cluster.awaitCompleted(concurrency, 10_000);
+            cluster.awaitAllInflightZero(10_000);
 
             assertEquals(0, totalErrors, "enqueue errors");
             long completedCount = services.values().stream()

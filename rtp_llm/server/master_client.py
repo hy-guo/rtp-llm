@@ -48,6 +48,7 @@ from rtp_llm.utils.base_model_datatypes import GenerateInput
 from rtp_llm.utils.grpc_host_channel_pool import GrpcHostChannelPool
 
 DEFAULT_REQUEST_TIMEOUT_SEC = 0.5
+DEFAULT_VIT_ROUTE_TIMEOUT_SEC = 5.0
 DEFAULT_VIT_HASH_PROBE_TIMEOUT_MS = 2_000
 VIT_ROUTE_STALE_CODE = 8408
 _HASH_RPC_UNSUPPORTED = object()
@@ -295,7 +296,6 @@ class MasterClient:
                         CANCEL_REASON_DEADLINE_EXCEEDED,
                         trace_metadata,
                     )
-                await self._close_channel(target)
                 raise FtRuntimeException(
                     exception_type=ExceptionType.DEADLINE_EXCEEDED,
                     message=f"FlexLB schedule deadline exceeded for request {request_id}",
@@ -411,7 +411,11 @@ class MasterClient:
                 if value is not None:
                     setattr(request_pb.selected_vit, name, value)
         if vit_only:
-            timeout_s = min(timeout_s, 0.5) if timeout_s is not None else 0.5
+            timeout_s = (
+                min(timeout_s, DEFAULT_VIT_ROUTE_TIMEOUT_SEC)
+                if timeout_s is not None
+                else DEFAULT_VIT_ROUTE_TIMEOUT_SEC
+            )
         if input_pb is not None and not vit_only:
             request_pb.generate_input = input_pb.SerializeToString()
 

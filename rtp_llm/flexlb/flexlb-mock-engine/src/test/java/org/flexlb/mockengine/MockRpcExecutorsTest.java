@@ -1,20 +1,23 @@
 package org.flexlb.mockengine;
 
+import static org.junit.jupiter.api.Assertions.*;
+
 import io.grpc.Context;
 import io.grpc.ManagedChannel;
 import io.grpc.Server;
 import io.grpc.Status;
 import io.grpc.netty.NettyChannelBuilder;
 import io.grpc.netty.NettyServerBuilder;
+
 import org.flexlb.engine.grpc.EngineRpcService;
 import org.flexlb.engine.grpc.RpcServiceGrpc;
 import org.junit.jupiter.api.Test;
+
 import java.util.ArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
-import static org.junit.jupiter.api.Assertions.*;
 
 class MockRpcExecutorsTest {
     static final class Endpoint implements AutoCloseable {
@@ -40,25 +43,46 @@ class MockRpcExecutorsTest {
             engine.stop();
         }
     }
+
+    static EngineRpcService.EnqueueBatchRequestPB request(long id) {
+        return EngineRpcService.EnqueueBatchRequestPB.newBuilder().setBatchId(id).build();
+    }
+
     static class Service extends RpcServiceGrpc.RpcServiceImplBase {
         final CountDownLatch entered = new CountDownLatch(1), release = new CountDownLatch(1), cancelled = new CountDownLatch(1);
         final AtomicInteger statuses = new AtomicInteger();
         final AtomicReference<String> methodThread = new AtomicReference<>();
-        @Override public void getCacheStatus(EngineRpcService.CacheVersionPB request,
-                io.grpc.stub.StreamObserver<EngineRpcService.CacheStatusPB> observer) {
+
+        @Override
+        public void enqueueBatch(
+                EngineRpcService.EnqueueBatchRequestPB request,
+                io.grpc.stub.StreamObserver<EngineRpcService.EnqueueBatchResponsePB> observer) {
             Context context = Context.current();
-            methodThread.set(Thread.currentThread().getName());
+            if (request.getBatchId() == 0) {
+                methodThread.set(Thread.currentThread().getName());
             context.addListener(ignored -> cancelled.countDown(), Runnable::run);
             entered.countDown();
             try { release.await(); } catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
+            } else statuses.incrementAndGet();
             if (!context.isCancelled()) {
-                observer.onNext(EngineRpcService.CacheStatusPB.getDefaultInstance()); observer.onCompleted();
+                observer.onNext(
+                        EngineRpcService.EnqueueBatchResponsePB.newBuilder()
+                                .setBatchId(request.getBatchId())
+                                .build());
+                observer.onCompleted();
             }
         }
         @Override public void getWorkerStatus(EngineRpcService.StatusVersionPB request,
                 io.grpc.stub.StreamObserver<EngineRpcService.WorkerStatusPB> observer) {
-            statuses.incrementAndGet();
             observer.onNext(EngineRpcService.WorkerStatusPB.newBuilder().setAlive(true).build()); observer.onCompleted();
+        }
+
+        @Override
+        public void getCacheStatus(
+                EngineRpcService.CacheVersionPB request,
+                io.grpc.stub.StreamObserver<EngineRpcService.CacheStatusPB> observer) {
+            observer.onNext(EngineRpcService.CacheStatusPB.getDefaultInstance());
+            observer.onCompleted();
         }
     }
     static void await(java.util.function.BooleanSupplier condition) throws Exception {
@@ -71,34 +95,93 @@ class MockRpcExecutorsTest {
             var a = new Service(); var b = new Service();
             try (var first = new Endpoint(pools, a); var second = new Endpoint(pools, b)) {
                 try {
-                    var cache = first.stub.getCacheStatus(EngineRpcService.CacheVersionPB.getDefaultInstance());
+                    var cache = first.stub.enqueueBatch(request(0));
                     assertTrue(a.entered.await(2, TimeUnit.SECONDS));
-                    var status = first.stub.getWorkerStatus(EngineRpcService.StatusVersionPB.getDefaultInstance());
+                    var status = first.stub.enqueueBatch(request(1));
                     await(() -> first.engine.inFlight() == 2);
                     assertFalse(status.isDone());
-                    assertTrue(second.stub.getWorkerStatus(EngineRpcService.StatusVersionPB.getDefaultInstance()).get(2, TimeUnit.SECONDS).getAlive());
+                    assertTrue(
+                            second.stub
+                                            .enqueueBatch(request(1))
+                                            .get(2, TimeUnit.SECONDS)
+                                            .getBatchId()
+                                    == 1);
                     assertTrue(a.methodThread.get().startsWith("mock-rpc-"));
                     a.release.countDown(); cache.get(2, TimeUnit.SECONDS);
-                    assertTrue(status.get(2, TimeUnit.SECONDS).getAlive());
+                    assertTrue(status.get(2, TimeUnit.SECONDS).getBatchId() == 1);
                 } finally { a.release.countDown(); }
             }
         }
     }
+
+    @Test
+    void statusAndCacheControlBypassFullBusinessAdmission() throws Exception {
+        try (var pools = new MockRpcExecutors(1, 1)) {
+            var service = new Service();
+            try (var endpoint = new Endpoint(pools, service)) {
+                try {
+                    var busy = endpoint.stub.enqueueBatch(request(0));
+                    assertTrue(service.entered.await(2, TimeUnit.SECONDS));
+                    assertTrue(
+                            endpoint.stub
+                                    .getWorkerStatus(
+                                            EngineRpcService.StatusVersionPB.getDefaultInstance())
+                                    .get(2, TimeUnit.SECONDS)
+                                    .getAlive());
+                    endpoint.stub
+                            .getCacheStatus(EngineRpcService.CacheVersionPB.getDefaultInstance())
+                            .get(2, TimeUnit.SECONDS);
+                    assertEquals(1, endpoint.engine.inFlight());
+                    assertEquals(0L, endpoint.engine.snapshot().get("rejected_calls_total"));
+                    service.release.countDown();
+                    busy.get(2, TimeUnit.SECONDS);
+                } finally {
+                    service.release.countDown();
+                }
+            }
+        }
+    }
+
+    @Test void engineRemovalWaitsForControlCallbacksWithoutConsumingBusinessPermits() throws Exception {
+        try (var pools = new MockRpcExecutors(1, 1)) {
+            var service = new Service() {
+                @Override public void getCacheStatus(EngineRpcService.CacheVersionPB request,
+                        io.grpc.stub.StreamObserver<EngineRpcService.CacheStatusPB> observer) {
+                    entered.countDown();
+                    try { release.await(); }
+                    catch (InterruptedException error) { Thread.currentThread().interrupt(); }
+                }
+            };
+            try (var endpoint = new Endpoint(pools, service)) {
+                try {
+                    endpoint.stub.getCacheStatus(EngineRpcService.CacheVersionPB.getDefaultInstance());
+                    assertTrue(service.entered.await(2, TimeUnit.SECONDS));
+                    assertEquals(0, endpoint.engine.inFlight());
+                    endpoint.engine.stop();
+                    assertThrows(IllegalStateException.class, () -> endpoint.engine.awaitStopped(
+                            System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(30)));
+                    service.release.countDown();
+                    endpoint.engine.awaitStopped(System.nanoTime() + TimeUnit.SECONDS.toNanos(2));
+                } finally { service.release.countDown(); }
+            }
+        }
+    }
+
     @Test void overloadRejectsOnlyNewCallsWithExplicitStatus() throws Exception {
         try (var pools = new MockRpcExecutors(1, 2)) {
             var service = new Service();
             try (var endpoint = new Endpoint(pools, service)) {
                 try {
-                    var cache = endpoint.stub.getCacheStatus(EngineRpcService.CacheVersionPB.getDefaultInstance());
+                    var cache = endpoint.stub.enqueueBatch(request(0));
                     assertTrue(service.entered.await(2, TimeUnit.SECONDS));
-                    var queued = endpoint.stub.getWorkerStatus(EngineRpcService.StatusVersionPB.getDefaultInstance());
+                    var queued = endpoint.stub.enqueueBatch(request(1));
                     await(() -> endpoint.engine.inFlight() == 2);
-                    var rejected = endpoint.stub.getWorkerStatus(EngineRpcService.StatusVersionPB.getDefaultInstance());
+                    var rejected = endpoint.stub.enqueueBatch(request(1));
                     Exception error = assertThrows(Exception.class, () -> rejected.get(2, TimeUnit.SECONDS));
                     assertEquals(Status.Code.RESOURCE_EXHAUSTED, Status.fromThrowable(error.getCause()).getCode());
                     assertEquals(1L, endpoint.engine.snapshot().get("rejected_calls_total"));
                     service.release.countDown(); cache.get(2, TimeUnit.SECONDS);
-                    assertTrue(queued.get(2, TimeUnit.SECONDS).getAlive());
+                    assertTrue(queued.get(2, TimeUnit.SECONDS).getBatchId() == 1);
                     await(() -> endpoint.engine.inFlight() == 0);
                 } finally { service.release.countDown(); }
             }
@@ -109,12 +192,15 @@ class MockRpcExecutorsTest {
             var service = new Service();
             try (var endpoint = new Endpoint(pools, service)) {
                 try {
-                    var cache = endpoint.stub.getCacheStatus(EngineRpcService.CacheVersionPB.getDefaultInstance());
+                    var cache = endpoint.stub.enqueueBatch(request(0));
                     assertTrue(service.entered.await(2, TimeUnit.SECONDS));
-                    var expired = endpoint.stub.withDeadlineAfter(100, TimeUnit.MILLISECONDS).getWorkerStatus(EngineRpcService.StatusVersionPB.getDefaultInstance());
+                    var expired =
+                            endpoint.stub
+                                    .withDeadlineAfter(100, TimeUnit.MILLISECONDS)
+                                    .enqueueBatch(request(1));
                     assertThrows(Exception.class, () -> expired.get(2, TimeUnit.SECONDS));
                     await(() -> endpoint.engine.inFlight() == 1);
-                    var live = endpoint.stub.getWorkerStatus(EngineRpcService.StatusVersionPB.getDefaultInstance());
+                    var live = endpoint.stub.enqueueBatch(request(1));
                     await(() -> endpoint.engine.inFlight() == 2);
                     service.release.countDown(); cache.get(2, TimeUnit.SECONDS); live.get(2, TimeUnit.SECONDS);
                     assertEquals(1, service.statuses.get());
@@ -126,21 +212,23 @@ class MockRpcExecutorsTest {
         try (var pools = new MockRpcExecutors(1, 2)) {
             var service = new Service();
             try (var endpoint = new Endpoint(pools, service)) {
-                var cache = endpoint.stub.getCacheStatus(EngineRpcService.CacheVersionPB.getDefaultInstance());
+                var cache = endpoint.stub.enqueueBatch(request(0));
                 assertTrue(service.entered.await(2, TimeUnit.SECONDS)); cache.cancel(true);
                 assertTrue(service.cancelled.await(2, TimeUnit.SECONDS));
                 await(() -> endpoint.engine.inFlight() == 0);
-                assertTrue(endpoint.stub.getWorkerStatus(EngineRpcService.StatusVersionPB.getDefaultInstance()).get(2, TimeUnit.SECONDS).getAlive());
+                assertTrue(
+                        endpoint.stub.enqueueBatch(request(1)).get(2, TimeUnit.SECONDS).getBatchId()
+                                == 1);
             } finally { service.release.countDown(); }
         }
     }
     @Test void shutdownDrainsBusyAndQueuedCallsAndIsIdempotent() throws Exception {
         var pools = new MockRpcExecutors(1, 64); var service = new Service();
         try (var endpoint = new Endpoint(pools, service)) {
-            endpoint.stub.getCacheStatus(EngineRpcService.CacheVersionPB.getDefaultInstance());
+            endpoint.stub.enqueueBatch(request(0));
             assertTrue(service.entered.await(2, TimeUnit.SECONDS));
             var calls = new ArrayList<java.util.concurrent.Future<?>>();
-            for (int i=0; i<32; i++) calls.add(endpoint.stub.getWorkerStatus(EngineRpcService.StatusVersionPB.getDefaultInstance()));
+            for (int i = 0; i < 32; i++) calls.add(endpoint.stub.enqueueBatch(request(1)));
             await(() -> endpoint.engine.inFlight() > 1);
             endpoint.channel.shutdownNow().awaitTermination(3, TimeUnit.SECONDS);
             endpoint.server.shutdownNow().awaitTermination(3, TimeUnit.SECONDS);
@@ -153,13 +241,18 @@ class MockRpcExecutorsTest {
             var service = new Service();
             try (var endpoint = new Endpoint(pools, service)) {
                 try {
-                    var cache = endpoint.stub.getCacheStatus(EngineRpcService.CacheVersionPB.getDefaultInstance());
+                    var cache = endpoint.stub.enqueueBatch(request(0));
                     assertTrue(service.entered.await(2, TimeUnit.SECONDS));
-                    var calls = new ArrayList<com.google.common.util.concurrent.ListenableFuture<EngineRpcService.WorkerStatusPB>>();
-                    for (int i=0; i<2048; i++) calls.add(endpoint.stub.getWorkerStatus(EngineRpcService.StatusVersionPB.getDefaultInstance()));
+                    var calls =
+                            new ArrayList<
+                                    com.google.common.util.concurrent.ListenableFuture<
+                                            EngineRpcService.EnqueueBatchResponsePB>>();
+                    for (int i = 0; i < 2048; i++)
+                        calls.add(endpoint.stub.enqueueBatch(request(1)));
                     await(() -> endpoint.engine.inFlight() > 1024);
                     service.release.countDown(); cache.get(5, TimeUnit.SECONDS);
-                    for (var call : calls) assertTrue(call.get(10, TimeUnit.SECONDS).getAlive());
+                    for (var call : calls)
+                        assertTrue(call.get(10, TimeUnit.SECONDS).getBatchId() == 1);
                     await(() -> endpoint.engine.inFlight() == 0);
                 } finally { service.release.countDown(); }
             }
@@ -188,7 +281,7 @@ class MockRpcExecutorsTest {
                                 @Override public void onCompleted() { }
                             });
                     assertTrue(started.await(2, TimeUnit.SECONDS));
-                    var cache = endpoint.stub.getCacheStatus(EngineRpcService.CacheVersionPB.getDefaultInstance());
+                    var cache = endpoint.stub.enqueueBatch(request(0));
                     assertTrue(service.entered.await(2, TimeUnit.SECONDS));
                     stream.get().cancel("client left", null);
                     assertTrue(cleaned.await(2, TimeUnit.SECONDS));
@@ -203,19 +296,28 @@ class MockRpcExecutorsTest {
     @Test void incompleteShutdownIsReportedAndCanBeRetried() throws Exception {
         var pools = new MockRpcExecutors(1, 2);
         var exited = new CountDownLatch(1);
-        var service = new Service() {
-            @Override public void getCacheStatus(EngineRpcService.CacheVersionPB request,
-                    io.grpc.stub.StreamObserver<EngineRpcService.CacheStatusPB> observer) {
-                entered.countDown();
-                try {
-                    while (release.getCount() > 0) {
-                        try { release.await(); } catch (InterruptedException ignored) { }
+        var service =
+                new Service() {
+                    @Override
+                    public void enqueueBatch(
+                            EngineRpcService.EnqueueBatchRequestPB request,
+                            io.grpc.stub.StreamObserver<EngineRpcService.EnqueueBatchResponsePB>
+                                    observer) {
+                        entered.countDown();
+                        try {
+                            while (release.getCount() > 0) {
+                                try {
+                                    release.await();
+                                } catch (InterruptedException ignored) {
+                                }
+                            }
+                        } finally {
+                            exited.countDown();
+                        }
                     }
-                } finally { exited.countDown(); }
-            }
-        };
+                };
         try (var endpoint = new Endpoint(pools, service)) {
-            endpoint.stub.getCacheStatus(EngineRpcService.CacheVersionPB.getDefaultInstance());
+            endpoint.stub.enqueueBatch(request(0));
             assertTrue(service.entered.await(2, TimeUnit.SECONDS));
             endpoint.channel.shutdownNow().awaitTermination(3, TimeUnit.SECONDS);
             endpoint.server.shutdownNow().awaitTermination(3, TimeUnit.SECONDS);

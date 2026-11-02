@@ -1,6 +1,9 @@
 package org.flexlb.cache.core;
 
 import lombok.extern.slf4j.Slf4j;
+
+import org.flexlb.collection.LongObjectMap;
+import org.flexlb.collection.SmallOwnerSet;
 import org.springframework.stereotype.Component;
 
 import java.util.Collections;
@@ -8,7 +11,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -25,7 +27,7 @@ public class GlobalCacheIndex {
     /**
      * Core storage structure: block_hash_id -> Set<engine_ip:engine_port>
      */
-    private final ConcurrentHashMap<Long, Set<String>> blockToEnginesMap = new ConcurrentHashMap<>();
+    private final LongObjectMap<Set<String>> blockToEnginesMap = new LongObjectMap<>();
 
     /**
      * Serializes index mutations and mapping-count updates
@@ -55,7 +57,7 @@ public class GlobalCacheIndex {
         lock.lock();
         try {
             Set<String> engines = blockToEnginesMap.computeIfAbsent(
-                    blockCacheKey, k -> ConcurrentHashMap.newKeySet());
+                    blockCacheKey, k -> new SmallOwnerSet());
 
             boolean added = engines.add(engineIpPort);
             if (added) {
