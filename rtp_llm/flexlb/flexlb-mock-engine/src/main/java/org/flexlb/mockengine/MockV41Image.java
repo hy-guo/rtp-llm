@@ -99,10 +99,7 @@ final class MockV41Image {
         var digest = MessageDigest.getInstance("SHA-256");
         digest.update(config.identity().getBytes(StandardCharsets.UTF_8));
         digest.update(ByteBuffer.allocate(8).putInt(grid[0]).putInt(grid[1]).array());
-        for (int y = 0; y < image.getHeight(); y++) for (int x = 0; x < image.getWidth(); x++) {
-            int rgb = image.getRGB(x, y);
-            digest.update((byte) (rgb >>> 16)); digest.update((byte) (rgb >>> 8)); digest.update((byte) rgb);
-        }
+        MockVitImage.updateRgbDigest(digest, image);
         return simulatedForward(rows, config, maxOutputBytes, digest.digest());
     }
 

@@ -148,10 +148,7 @@ final class MockVitImage {
         if (bytes > maxOutputBytes || bytes > Integer.MAX_VALUE)
             throw new IllegalArgumentException("embedding exceeds output byte limit");
         MessageDigest digest = MessageDigest.getInstance("SHA-256");
-        for (int y = 0; y < image.getHeight(); y++) for (int x = 0; x < image.getWidth(); x++) {
-            int rgb = image.getRGB(x, y);
-            digest.update((byte)(rgb >>> 16)); digest.update((byte)(rgb >>> 8)); digest.update((byte)rgb);
-        }
+        updateRgbDigest(digest, image);
         String cacheKey = key(input);
         digest.update(cacheKey.substring(cacheKey.indexOf('_')).getBytes(StandardCharsets.UTF_8));
         digest.update(ByteBuffer.allocate(8).putInt(geometry[0]).putInt(geometry[1]).array());
@@ -171,5 +168,24 @@ final class MockVitImage {
                 .addShape(rows).addShape(hiddenSize).setFp32Data(ByteString.copyFrom(features.array())).build(),
                 EngineRpcService.TensorPB.newBuilder().setDataType(EngineRpcService.TensorPB.DataType.INT32)
                         .addShape(rows).setInt32Data(ByteString.copyFrom(hashes.array())).build(), rows);
+    }
+    /** Same RGB byte stream as per-pixel getRGB, with bounded scratch and bulk SHA input. */
+    static void updateRgbDigest(MessageDigest digest, BufferedImage image) {
+        int chunk = Math.min(image.getWidth(), 4096);
+        int[] pixels = new int[chunk];
+        byte[] bytes = new byte[chunk * 3];
+        for (int y = 0; y < image.getHeight(); y++) {
+            for (int x = 0; x < image.getWidth(); x += chunk) {
+                int count = Math.min(chunk, image.getWidth() - x);
+                image.getRGB(x, y, count, 1, pixels, 0, count);
+                for (int i = 0, offset = 0; i < count; i++) {
+                    int rgb = pixels[i];
+                    bytes[offset++] = (byte)(rgb >>> 16);
+                    bytes[offset++] = (byte)(rgb >>> 8);
+                    bytes[offset++] = (byte)rgb;
+                }
+                digest.update(bytes, 0, count * 3);
+            }
+        }
     }
 }
