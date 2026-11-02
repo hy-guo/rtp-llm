@@ -67,6 +67,32 @@ class CancelTerminalBatchIdTest {
     }
 
     @Test
+    void lateDirectRequestHonorsAbsentFenceBeforeMultimodalPreparation() throws Exception {
+        newPrefillService(model("10"));
+        long id = 901L;
+        assertTrue(!prefill.cancelRequest(id).found());
+        var failure = new java.util.concurrent.atomic.AtomicReference<Throwable>();
+        var request = input(id, 16).toBuilder().addMultimodalInputs(
+                EngineRpcService.MultimodalInputPB.newBuilder()
+                        .setMultimodalUrl("data:image/webp;base64,invalid")
+                        .setMultimodalType(1)).build();
+        // No ViT route exists. Reaching preparation would fail differently.
+        prefill.generateStreamCall(request, new io.grpc.stub.StreamObserver<>() {
+            @Override public void onNext(EngineRpcService.GenerateOutputsPB value) {
+                throw new AssertionError("fenced request cannot produce output");
+            }
+            @Override public void onError(Throwable error) { failure.set(error); }
+            @Override public void onCompleted() { throw new AssertionError("fenced request cannot succeed"); }
+        });
+        assertNotNull(failure.get());
+        assertEquals(8429L, MockRpcErrors.downstream(failure.get()).getErrorCode());
+        assertEquals(0L, ((Number) prefill.getSnapshot().get("accepted")).longValue());
+        assertEquals(0L, ((Number) prefill.getSnapshot().get("running")).longValue());
+        assertEquals(0L, ((Number) prefill.getSnapshot().get("response_buffers")).longValue());
+        assertTrue(!prefill.cancelRequest(id).found(), "late rejection must preserve the absent fence");
+    }
+
+    @Test
     void cancelTerminalCarriesEnqueueBatchIdentity() throws Exception {
         // Prefill expression 20000ms * sleep_scale 0.1 = 2000ms — a wide
         // execution window so cancel() reliably lands while the batch runs.

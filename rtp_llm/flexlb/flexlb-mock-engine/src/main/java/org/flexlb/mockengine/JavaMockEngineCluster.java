@@ -2269,6 +2269,12 @@ public final class JavaMockEngineCluster {
             }
 
             long requestId = request.getRequestId();
+            // A queued direct RPC can arrive after Master Cancel installed an
+            // absent fence. Match EnqueueBatch: do not spend ViT/Decode work on it.
+            if (hasFencedRequestId(requestId)) {
+                observer.onError(capacityError(8429, "absent fence: cancel fenced this rid before generation"));
+                return;
+            }
             beginRequest(request);
             List<EngineRpcService.MultimodalCacheSpanPB> mediaSpans = List.of();
             if (isDiagnosticPrefill() && (request.getMultimodalInputsCount() > 0 || request.hasV41Inputs())) {
@@ -2278,6 +2284,11 @@ public final class JavaMockEngineCluster {
                     mediaSpans = prepared.spans();
                 }
                 catch (RuntimeException error) { finishRequest(request.getRequestId()); observer.onError(error); return; }
+            }
+            if (hasFencedRequestId(requestId)) {
+                finishRequest(requestId);
+                observer.onError(capacityError(8429, "absent fence: cancel fenced this rid during preparation"));
+                return;
             }
             MockPerformanceModel.RequestShape shape = matchPrefillMemory(performance.shape(request, cache, mediaSpans));
             observeCacheDiagnostics(shape);

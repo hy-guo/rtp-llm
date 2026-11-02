@@ -92,6 +92,7 @@ legacy JAR 是否存在取决于 CI 配方，见[构建与产物](README.md#ci-�
 | `MOCK_PREFILL_KV_POOL_BLOCKS` / `MOCK_DECODE_KV_POOL_BLOCKS` | 每引擎各 1024 块 |
 | `MOCK_DECODE_MAX_CONCURRENCY` | 每个 D 为 128 |
 | `MOCK_EVENT_LOOP_THREADS` / `MOCK_COMPLETION_THREADS` | 各 4 |
+| `MOCK_RPC_THREADS` | 每引擎 RPC 回调并行度，1～256；含 P 的独立进程默认 16，纯 D 默认 2；独立于计算批并行度 |
 | `MOCK_JAVA_OPTS` | `-Xms512m -Xmx2g`；支持引号，不执行 shell |
 | `FETCH_OUTPUT_STREAM` | 默认 1；0 开启自动接续 |
 | `MOCK_KMONITOR_ENABLED` | true |

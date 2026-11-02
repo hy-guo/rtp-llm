@@ -115,6 +115,41 @@ class MockRpcExecutorsTest {
     }
 
     @Test
+    void independentRequestProgressesWhileTwoPreparationsWaitForIo() throws Exception {
+        var preparing = new CountDownLatch(2);
+        var ioRelease = new CountDownLatch(1);
+        try (var pools = new MockRpcExecutors(16, 32)) {
+            var service = new Service() {
+                @Override public void enqueueBatch(EngineRpcService.EnqueueBatchRequestPB request,
+                        io.grpc.stub.StreamObserver<EngineRpcService.EnqueueBatchResponsePB> observer) {
+                    if (request.getBatchId() < 2) {
+                        preparing.countDown();
+                        try { ioRelease.await(); }
+                        catch (InterruptedException error) { Thread.currentThread().interrupt(); }
+                    }
+                    observer.onNext(EngineRpcService.EnqueueBatchResponsePB.newBuilder()
+                            .setBatchId(request.getBatchId()).build());
+                    observer.onCompleted();
+                }
+            };
+            try (var endpoint = new Endpoint(pools, service)) {
+                try {
+                    var first = endpoint.stub.enqueueBatch(request(0));
+                    var second = endpoint.stub.enqueueBatch(request(1));
+                    assertTrue(preparing.await(2, TimeUnit.SECONDS));
+                    assertEquals(2, ((Number) endpoint.engine.snapshot().get("active_callbacks")).intValue());
+                    assertEquals(2, endpoint.stub.enqueueBatch(request(2)).get(2, TimeUnit.SECONDS).getBatchId());
+                    assertEquals(1, ioRelease.getCount(), "independent progress must not require completing either I/O");
+                    ioRelease.countDown();
+                    first.get(2, TimeUnit.SECONDS);
+                    second.get(2, TimeUnit.SECONDS);
+                    await(() -> endpoint.engine.inFlight() == 0);
+                } finally { ioRelease.countDown(); }
+            }
+        }
+    }
+
+    @Test
     void statusAndCacheControlBypassFullBusinessAdmission() throws Exception {
         try (var pools = new MockRpcExecutors(1, 1)) {
             var service = new Service();

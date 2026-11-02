@@ -36,6 +36,7 @@ class StandaloneMockTest(unittest.TestCase):
                             ("--auto-fetch", "false"), ("--kmonitor", "true"),
                             ("--cache-status-compact-encoding", "false"),
                             ("--grpc-max-inbound-message-bytes", "2147483647"),
+                            ("--rpc-threads", "16"),
                             ("--prefill-kv-pool-blocks", "113282"),
                             ("--decode-kv-pool-blocks", "113282")):
             self.assertEqual(args[args.index(flag) + 1], value)
@@ -59,6 +60,18 @@ class StandaloneMockTest(unittest.TestCase):
         self.env["MOCK_CACHE_STATUS_COMPACT_ENCODING"] = "1"
         args = standalone_mock.command(self.env)
         self.assertEqual(args[args.index("--cache-status-compact-encoding") + 1], "true")
+
+    def test_rpc_io_concurrency_is_separate_from_compute_capacity(self):
+        for role, default in (("PREFILL", "16"), ("DECODE", "2")):
+            env = {**self.env, "ROLE_TYPE": role, "MOCK_DEPLOYMENT_MODE": "per_engine",
+                   "MOCK_PREFILL_COUNT": str(int(role == "PREFILL")),
+                   "MOCK_DECODE_COUNT": str(int(role == "DECODE"))}
+            args = standalone_mock.command(env)
+            self.assertEqual(args[args.index("--rpc-threads") + 1], default)
+            self.assertEqual(args[args.index("--decode-max-concurrency") + 1], "128")
+            env["MOCK_RPC_THREADS"] = "8"
+            args = standalone_mock.command(env)
+            self.assertEqual(args[args.index("--rpc-threads") + 1], "8")
 
     def test_model_metadata_reaches_both_prefill_and_decode_without_frontend_patch(self):
         model = Path(self.directory.name) / "checkpoint"
@@ -98,6 +111,8 @@ class StandaloneMockTest(unittest.TestCase):
             {"MOCK_PREFILL_COUNT": "-1"},
             {"MOCK_GRPC_BASE_PORT": "65534"},
             {"MOCK_DECODE_KV_POOL_BLOCKS": "zero"},
+            {"MOCK_RPC_THREADS": "0"}, {"MOCK_RPC_THREADS": "257"},
+            {"MOCK_RPC_THREADS": "invalid"},
             {"POD_IP": "127.0.0.1"}, {"POD_IP": "0.0.0.0"},
             {"FETCH_OUTPUT_STREAM": "maybe"},
             {"MOCK_CACHE_STATUS_COMPACT_ENCODING": "maybe"},

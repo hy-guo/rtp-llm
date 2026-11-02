@@ -85,6 +85,11 @@ def command(env):
         ("--grpc-max-inbound-message-bytes", "MOCK_GRPC_MAX_INBOUND_MESSAGE_BYTES", 2147483647),
     ):
         numeric[flag] = integer(env, key, default)
+    # Prefill callbacks wait for remote ViT/Decode I/O. This harness quota is
+    # independent of modeled compute concurrency and must not serialize them.
+    numeric["--rpc-threads"] = integer(
+        env, "MOCK_RPC_THREADS", 16 if prefill else 2, maximum=256
+    )
     performance = json_object(
         env.get("MOCK_PERFORMANCE_CONFIG_JSON", (ROOT / "performance.json").read_text()),
         "MOCK_PERFORMANCE_CONFIG_JSON",
