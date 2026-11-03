@@ -181,6 +181,42 @@ class KvcmEventPublisherTest {
         assertTrue(mutations.stream().anyMatch(m -> !m.added() && Long.valueOf(7).equals(m.key())));
     }
 
+    @Test void primitiveSnapshotRetainsAtomicVersionAndExcludesIncompleteKeys() {
+        var cache = new MockLruBlockCache(4);
+        cache.configurePublicationGroups(2);
+        cache.admit(List.of(Long.MIN_VALUE, Long.MAX_VALUE));
+        var mutations = new ArrayList<MockLruBlockCache.Mutation>();
+        cache.setMutationListener(mutations::add);
+        var original = cache.keyArraySnapshot();
+        assertEquals(0, original.version());
+        assertArrayEquals(new long[]{Long.MIN_VALUE, Long.MAX_VALUE}, original.keys());
+        cache.setGroupResident(Long.MIN_VALUE, 1, false);
+        var partial = cache.keyArraySnapshot();
+        assertEquals(1, partial.version());
+        assertArrayEquals(new long[]{Long.MAX_VALUE}, partial.keys());
+        cache.clear();
+        assertArrayEquals(new long[]{Long.MAX_VALUE}, partial.keys(), "snapshot must own its key array");
+        assertEquals(2, cache.keyArraySnapshot().version());
+        assertEquals(0, cache.keyArraySnapshot().keys().length);
+    }
+
+    @Test void startupPreloadPublishesOneAuthoritativeSnapshotThenNaturalEvictions() throws Exception {
+        var cache = new MockLruBlockCache(100);
+        cache.preloadIndependentRoots(MockCachePreload.workerId("10.1.2.3"), 20261102L);
+        var expected = new HashSet<>(cache.snapshotKeys());
+        var peer = new Peer();
+        try (var publisher = new KvcmEventPublisher(config(2), cache, "host:1", 1024, () -> true, peer)) {
+            publisher.start();
+            until(() -> peer.keys.equals(expected) && publisher.status().get("state").equals("READY"));
+            assertEquals(0L, publisher.status().get("overflows"));
+            assertTrue(peer.events("EVENT_BLOCK_ADD").isEmpty());
+            cache.admit(List.of(42L));
+            until(() -> peer.keys.equals(cache.snapshotKeys()));
+            assertEquals(100, peer.keys.size());
+            assertTrue(peer.keys.contains(42L));
+        }
+    }
+
     @Test void registersSnapshotsAddsDeletesHeartbeatsAndHostDown() throws Exception {
         var cache = new MockLruBlockCache(16);
         cache.admit(List.of(1L));

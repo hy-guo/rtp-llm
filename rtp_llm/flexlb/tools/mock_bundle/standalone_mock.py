@@ -90,6 +90,13 @@ def command(env):
     numeric["--rpc-threads"] = integer(
         env, "MOCK_RPC_THREADS", 16 if prefill else 2, maximum=256
     )
+    preload_mode = env.get("MOCK_CACHE_PRELOAD_MODE", "none")
+    if preload_mode not in ("none", "independent_prefixes_86pct_shared"):
+        raise ValueError("Unsupported MOCK_CACHE_PRELOAD_MODE")
+    preload_seed = integer(env, "MOCK_CACHE_PRELOAD_SEED", 20261102,
+                           minimum=-(1 << 63), maximum=(1 << 63) - 1)
+    if preload_mode != "none" and prefill and numeric["--prefill-kv-pool-blocks"] > 4_000_000:
+        raise ValueError("Cache preload supports at most 4000000 physical blocks")
     performance = json_object(
         env.get("MOCK_PERFORMANCE_CONFIG_JSON", (ROOT / "performance.json").read_text()),
         "MOCK_PERFORMANCE_CONFIG_JSON",
@@ -109,7 +116,8 @@ def command(env):
             "-jar", str(jar), "--whale", "true", "--whale-bundle", str(not remote_decode).lower(),
             "--kmonitor", str(kmonitor).lower(), "--host", host,
             "--unique-engine-ips", "false", "--auto-fetch", str(not fetch).lower(),
-            "--cache-status-compact-encoding", str(compact).lower()]
+            "--cache-status-compact-encoding", str(compact).lower(),
+            "--cache-preload-mode", preload_mode, "--cache-preload-seed", str(preload_seed)]
     checkpoint = env.get("CHECKPOINT_PATH") or env.get("TOKENIZER_PATH")
     if checkpoint:
         from whale_frontend_fixture import prepare_assets

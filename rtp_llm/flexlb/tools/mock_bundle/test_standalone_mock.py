@@ -22,6 +22,22 @@ class StandaloneMockTest(unittest.TestCase):
             "MOCK_DECODE_KV_POOL_BLOCKS": "113282",
         }
 
+    def test_native_cache_preload_flags_and_validation(self):
+        env = {**self.env, "MOCK_CACHE_PRELOAD_MODE": "independent_prefixes_86pct_shared",
+               "MOCK_CACHE_PRELOAD_SEED": "20261102"}
+        args = standalone_mock.command(env)
+        self.assertEqual(args[args.index("--cache-preload-mode") + 1],
+                         "independent_prefixes_86pct_shared")
+        self.assertEqual(args[args.index("--cache-preload-seed") + 1], "20261102")
+        for key, value in (("MOCK_CACHE_PRELOAD_MODE", "typo"),
+                           ("MOCK_CACHE_PRELOAD_SEED", "9223372036854775808"),
+                           ("MOCK_CACHE_PRELOAD_SEED", "NaN"),
+                           ("MOCK_PREFILL_KV_POOL_BLOCKS", "4000001")):
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                standalone_mock.command({**env, key: value})
+        default = standalone_mock.command(self.env)
+        self.assertEqual(default[default.index("--cache-preload-mode") + 1], "none")
+
     def test_five_engines_use_one_java_process_and_preserve_capacity(self):
         with patch.dict(os.environ, self.env, clear=True), patch.object(
             standalone_mock.os, "execv"

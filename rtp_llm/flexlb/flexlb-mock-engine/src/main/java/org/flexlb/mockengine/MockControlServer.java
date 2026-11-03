@@ -93,6 +93,7 @@ final class MockControlServer {
         httpServer.createContext("/set_queue_depth", this::handleSetQueueDepth);
         httpServer.createContext("/cache_fixture", this::handleCacheFixture);
         httpServer.createContext("/cache_seed", this::handleCacheSeed);
+        httpServer.createContext("/cache_preload", this::handleCachePreload);
         httpServer.createContext("/cache_evict", this::handleCacheEvict);
         httpServer.createContext("/cache_group_residency", exchange -> handleServicePost(exchange, (body, service) -> {
             if (!body.path("resident").isBoolean() || !body.path("group").isTextual() || !body.has("key"))
@@ -116,6 +117,22 @@ final class MockControlServer {
             t.setDaemon(true);
             return t;
         }));
+    }
+
+    private void handleCachePreload(HttpExchange exchange) throws IOException {
+        if (!"GET".equals(exchange.getRequestMethod())) {
+            sendJson(exchange, 405, Map.of("error", "Method Not Allowed"));
+            return;
+        }
+        List<Map<String, Object>> engines = new ArrayList<>();
+        for (var service : services.values()) {
+            Map<String, Object> status = new LinkedHashMap<>(service.cachePreloadStatus());
+            status.put("engine", service.getEngineName());
+            status.put("role", service.getRoleName());
+            status.put("port", service.getGrpcPort());
+            engines.add(status);
+        }
+        sendJson(exchange, 200, Map.of("engines", engines));
     }
 
     void start() {

@@ -475,6 +475,43 @@ final class KvcmEventPublisher implements AutoCloseable {
         return root;
     }
 
+    /** Same complete-key snapshot protocol as KVCMPublisher.cc, without a per-key JSON tree. */
+    private String snapshotBody(long[] keys) throws java.io.IOException {
+        var output = new java.io.StringWriter();
+        try (var writer = JSON.getFactory().createGenerator(output)) {
+            writer.writeStartObject();
+            writer.writeStringField("trace_id", trace());
+            writer.writeStringField("instance_id", instanceId);
+            writer.writeStringField("host_ip_port", host);
+            writer.writeStringField("storage_type", config.storageType());
+            writer.writeArrayFieldStart("events");
+            writer.writeStartObject();
+            writer.writeStringField("event_type", "EVENT_BLOCK_SNAPSHOT");
+            writer.writeObjectFieldStart("block_snapshot");
+            writer.writeArrayFieldStart("blocks");
+            String name = specName();
+            String uri = "event_report://" + host + "/hbm?size=" + locationSize();
+            for (long key : keys) {
+                writer.writeStartObject();
+                writer.writeStringField("block_key", Long.toString(key));
+                writer.writeStringField("medium", "hbm");
+                writer.writeArrayFieldStart("specs");
+                writer.writeStartObject();
+                writer.writeStringField("name", name);
+                writer.writeStringField("uri", uri);
+                writer.writeEndObject();
+                writer.writeEndArray();
+                writer.writeEndObject();
+            }
+            writer.writeEndArray();
+            writer.writeEndObject();
+            writer.writeEndObject();
+            writer.writeEndArray();
+            writer.writeEndObject();
+        }
+        return output.toString();
+    }
+
     private boolean post(String route, String body) throws Exception {
         long epoch = snapshotEpoch.get();
         feedback.remove();
@@ -600,15 +637,8 @@ final class KvcmEventPublisher implements AutoCloseable {
                         }
                         if (pending == null) {
                             long generation = dirty.get();
-                            var snapshot = cache.componentSnapshot();
-                            ObjectNode root = report();
-                            ArrayNode blocks = event(root, "EVENT_BLOCK_SNAPSHOT", "block_snapshot").putArray("blocks");
-                            for (var entry : snapshot.groups().entrySet()) {
-                                ObjectNode block = blocks.addObject().put("block_key", entry.getKey().toString()).put("medium", "hbm");
-                                ArrayNode specs = block.putArray("specs");
-                                spec(specs);
-                            }
-                            pending = new Pending(root.toString(), snapshot.version(), generation);
+                            var snapshot = cache.keyArraySnapshot();
+                            pending = new Pending(snapshotBody(snapshot.keys()), snapshot.version(), generation);
                         }
                         // Retry the identical snapshot until acknowledged; do not
                         // replace an uncertain request with a newer snapshot.

@@ -132,3 +132,25 @@ fixture 与真实推理 KV 容量相互独立的边界。Real 的全量响应仍
 构造 protobuf Map；这里的直接编码是 Mock 的负载生成优化，不代表 real 没有这些成本。
 该路径适合验证 Master 的解析、索引和健康隔离，不能用于验收真实引擎侧的大响应
 资源消耗或心跳延迟。实验仍须按实际响应条目/s、bytes/s 验收同步强度。
+
+### Native startup cache preload (Mock only)
+
+`MOCK_CACHE_PRELOAD_MODE=independent_prefixes_86pct_shared` and
+`MOCK_CACHE_PRELOAD_SEED=20261102` (Java flags `--cache-preload-mode` /
+`--cache-preload-seed`) fill each Prefill physical pool with independent, unreferenced,
+nonresident prefix roots before RPC readiness and KVCM publisher initialization.
+Mode defaults to `none`; Decode is unchanged. The startup workload is limited to
+1–4,000,000 physical blocks; block size and pool capacity remain unchanged.
+For N blocks, floor(0.86*N) keys are shared across IPv4 worker identities, and
+remaining keys are private to each worker. A signed 64-bit seed selects a deterministic
+bijective key permutation. Shared-key fraction does not prescribe request hit rate.
+These are ordinary LRU entries: requests can reuse and evict them, availability still
+includes unreferenced LRU blocks, and both LOCAL_SYNC and KVCM publish the actual cache.
+This follows the insertion/match/LRU semantics in `cpp/cache/BlockCache.cc` and
+`cpp/cache/test/BlockCacheTest.cc`; generating synthetic startup keys is Mock-specific.
+`GET /cache_preload` reports immutable startup counts plus current occupancy and
+publisher status, without exporting keys. No inference counters are synthesized.
+
+KVCM full snapshots capture primitive keys and the mutation cutoff atomically, then
+stream the JSON encoding (as in real `cache/events/KVCMPublisher.cc`) to avoid a
+per-key JSON object tree at million-block scale. Retries retain the identical payload.

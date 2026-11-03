@@ -355,6 +355,7 @@ public final class JavaMockEngineCluster {
         service.performance.nativeTokenCacheKeys = config.whale;
         service.whalePodIp = config.host;
         service.setFetchAttachTimeoutMs(config.fetchAttachTimeoutMs);
+        service.initializeCachePreload(config.cachePreloadMode, config.cachePreloadSeed);
         if (config.engineInitializer != null) config.engineInitializer.accept(service);
         services.put(grpcPort, service);
         try {
@@ -5759,6 +5760,44 @@ public final class JavaMockEngineCluster {
             return cacheVersion.get() + (fixture == null ? 0 : fixture.version());
         }
 
+        /** Immutable startup proof; subsequent requests own all cache changes. */
+        private Map<String, Object> cachePreloadProof = Map.of("mode", "none", "completed", false);
+
+        synchronized void initializeCachePreload(String mode, long seed) {
+            MockCachePreload.validateMode(mode);
+            if ("none".equals(mode) || roleType != EngineRpcService.RoleTypePB.ROLE_TYPE_PREFILL) return;
+            if (naturalCacheSeeded || acceptedCount.get() != 0 || cacheSyncFixture != null || kvcmPublisher != null)
+                throw new IllegalArgumentException("cache preload must precede traffic, fixtures and KVCM publication");
+            long worker = MockCachePreload.workerId(host);
+            long started = System.nanoTime();
+            cache.preloadIndependentRoots(worker, seed);
+            naturalCacheSeeded = true;
+            cacheVersion.incrementAndGet();
+            Map<String, Object> proof = new LinkedHashMap<>();
+            proof.put("mode", mode);
+            proof.put("seed", seed);
+            proof.put("worker_id", worker);
+            proof.put("completed", true);
+            proof.put("initial_blocks", cache.lruKeyBlocks());
+            proof.put("shared_blocks", MockCachePreload.sharedBlocks(cache.totalBlocks()));
+            proof.put("private_blocks", cache.totalBlocks() - MockCachePreload.sharedBlocks(cache.totalBlocks()));
+            proof.put("initial_held_blocks", cache.heldBlocks());
+            proof.put("initial_referenced_blocks", cache.referencedKeyBlocks());
+            proof.put("elapsed_ms", (System.nanoTime() - started) / 1_000_000L);
+            cachePreloadProof = Map.copyOf(proof);
+        }
+
+        synchronized Map<String, Object> cachePreloadStatus() {
+            Map<String, Object> status = new LinkedHashMap<>(cachePreloadProof);
+            status.put("pool_blocks", cache.totalBlocks());
+            status.put("live_key_blocks", cache.lruKeyBlocks());
+            status.put("held_blocks", cache.heldBlocks());
+            status.put("referenced_blocks", cache.referencedKeyBlocks());
+            status.put("evictions", cache.evictions());
+            if (kvcmPublisher != null) status.put("kvcm", kvcmPublisher.status());
+            return status;
+        }
+
         /** One-time warm start of the ordinary cache; subsequent requests own all changes. */
         synchronized Map<String, Object> seedNaturalCache(List<Long> keys) {
             if (naturalCacheSeeded)
@@ -6936,6 +6975,7 @@ public final class JavaMockEngineCluster {
             // Python cluster.snapshot() adds "stopped" per engine.
             snap.put("stopped", stopped);
             if (kvcmPublisher != null) snap.put("kvcm", kvcmPublisher.status());
+            snap.put("cache_preload", cachePreloadStatus());
             snap.putAll(admissionSnapshot());
             // Java-only fields retained (do not rename Python fields above).
             snap.put("port", grpcPort);
@@ -7272,6 +7312,8 @@ public final class JavaMockEngineCluster {
          * non-zero value overrides derivation.
          */
         int prefillCacheBlocks = 0;
+        String cachePreloadMode = "none";
+        long cachePreloadSeed = 20261102L;
         int decodeCacheBlocks = 0;
         String host = "127.0.0.1";
         String bindHost = "0.0.0.0";
@@ -7358,6 +7400,8 @@ public final class JavaMockEngineCluster {
                     case "--grpc-max-inbound-message-bytes" -> config.grpcMaxInboundMessageBytes = Integer.parseInt(value);
                     case "--auto-fetch" -> config.autoFetch = parseBooleanFlag(value, key);
                     case "--fetch-attach-timeout-ms" -> config.fetchAttachTimeoutMs = Long.parseLong(value);
+                    case "--cache-preload-mode" -> { MockCachePreload.validateMode(value); config.cachePreloadMode = value; }
+                    case "--cache-preload-seed" -> config.cachePreloadSeed = Long.parseLong(value);
                     case "--prefill-kv-pool-blocks" -> config.prefillCacheBlocks = Integer.parseInt(value);
                     case "--decode-kv-pool-blocks" -> config.decodeCacheBlocks = Integer.parseInt(value);
                     case "--host" -> config.host = value;

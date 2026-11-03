@@ -83,6 +83,11 @@ final class MockLruBlockCache {
         Mutation(long version, Long key, boolean added) { this(version, key, added, 0); }
     }
     record ComponentSnapshot(long version, Map<Long, List<Integer>> groups) {}
+    /** Owned primitive keys + matching journal cutoff, captured atomically. */
+    record KeyArraySnapshot(long version, long[] keys) {}
+    synchronized KeyArraySnapshot keyArraySnapshot() {
+        return new KeyArraySnapshot(mutationVersion, snapshotKeyArray());
+    }
     private int publicationGroups = 1;
     // Only incomplete keys need overrides; normal inference completes all simulated groups together.
     private final Map<Long, Set<Integer>> absentPublicationGroups = new HashMap<>();
@@ -489,6 +494,20 @@ final class MockLruBlockCache {
         long beforeTrim = retentionEvictions;
         trimRetention();
         return changed || retentionEvictions != beforeTrim;
+    }
+
+    /** Startup only, before publication: seed independent roots without building a giant key list. */
+    synchronized void preloadIndependentRoots(long worker, long seed) {
+        if (totalBlocks < 1 || totalBlocks > MockCachePreload.MAX_BLOCKS
+                || retentionBlocks != totalBlocks || !blocks.isEmpty() || heldBlocks != 0
+                || mutationListener != null)
+            throw new IllegalArgumentException("preload requires a fresh, unpublished full-retention pool of 1..4000000 blocks");
+        for (int i = 0; i < totalBlocks; i++) {
+            Long key = MockCachePreload.key(i, totalBlocks, worker, seed);
+            blocks.put(key, 0);
+            // Each key is its own prefix; connecting all keys would evict the entire pool together.
+            indexSequence(java.util.Collections.singletonList(key));
+        }
     }
 
     // ─────────────────────────── forced eviction (/cache_evict) ───────────────────────────

@@ -40,7 +40,15 @@ class KvcmEngineProcessTest {
     }
 
     @Test void runtimeEnvironmentPublishesRequestKeysEvictionsAndShutdownPerEngine() throws Exception {
-        int base = Integer.parseInt(System.getenv().getOrDefault("FLEXLB_PORT_BASE", "62400")) + 10;
+        exerciseProcess(false);
+    }
+
+    @Test void nativePreloadPrecedesRpcAndKvcmSnapshotInRealJvmStartup() throws Exception {
+        exerciseProcess(true);
+    }
+
+    private void exerciseProcess(boolean preload) throws Exception {
+        int base = Integer.parseInt(System.getenv().getOrDefault("FLEXLB_PORT_BASE", "62400")) + (preload ? 30 : 10);
         String prefill = "127.0.0.2:" + (base - 1), decode = "127.0.0.2:" + base;
         Map<String, Set<Long>> owners = new ConcurrentHashMap<>();
         Set<String> down = ConcurrentHashMap.newKeySet();
@@ -87,6 +95,9 @@ class KvcmEngineProcessTest {
                     "--whale", "true", "--whale-bundle", "true", "--unique-engine-ips", "false",
                     "--n-prefill", "1", "--n-decode", "1", "--host", "127.0.0.2", "--bind-host", "127.0.0.2",
                     "--base-grpc-port", Integer.toString(base), "--event-loop-threads", "2", "--completion-threads", "2",
+                    "--prefill-kv-pool-blocks", "16",
+                    "--cache-preload-mode", preload ? MockCachePreload.MODE : "none",
+                    "--cache-preload-seed", "20261102",
                     "--performance", performance.toString(),
                     "--master-config", master.toString(),
                     "--endpoint-file", directory.resolve("endpoints.json").toString())
@@ -98,6 +109,26 @@ class KvcmEngineProcessTest {
             builder.environment().remove("KV_CACHE_EVENT_HOST_IP_PORT");
             process = builder.start();
             until(() -> owners.containsKey(prefill) && owners.containsKey(decode));
+            until(() -> owners.get(prefill).size() == (preload ? 16 : 0));
+            assertTrue(owners.get(decode).isEmpty());
+            until(() -> {
+                try {
+                    return http.send(HttpRequest.newBuilder(URI.create("http://127.0.0.2:" + (base - 1)
+                            + "/health")).timeout(Duration.ofSeconds(1)).GET().build(),
+                            HttpResponse.BodyHandlers.discarding()).statusCode() == 200;
+                } catch (Exception notReady) { return false; }
+            });
+            var proof = http.send(HttpRequest.newBuilder(URI.create("http://127.0.0.2:" + (base - 1)
+                    + "/cache_preload")).GET().build(), HttpResponse.BodyHandlers.ofString());
+            assertEquals(200, proof.statusCode());
+            if (preload) {
+                var engines = JSON.readTree(proof.body()).path("engines");
+                assertTrue(java.util.stream.StreamSupport.stream(engines.spliterator(), false)
+                        .anyMatch(engine -> engine.path("completed").asBoolean()
+                                && engine.path("initial_blocks").asInt() == 16
+                                && engine.path("seed").asLong() == 20261102L));
+            }
+
             channel = ManagedChannelBuilder.forAddress("127.0.0.2", base).usePlaintext().build();
             var stub = RpcServiceGrpc.newBlockingStub(channel).withDeadlineAfter(10, TimeUnit.SECONDS);
             var status = stub.getWorkerStatus(EngineRpcService.StatusVersionPB.getDefaultInstance());
@@ -119,7 +150,8 @@ class KvcmEngineProcessTest {
                 completed |= frame.getFlattenOutput().getFinishedList().contains(true);
             }
             assertTrue(completed);
-            until(() -> owners.get(prefill).size() == 2 && owners.get(decode).size() == 2);
+            // 2049 tokens reserve 3 physical blocks, but only 2 full prefix keys are retained.
+            until(() -> owners.get(prefill).size() == (preload ? 15 : 2) && owners.get(decode).size() == 2);
             var snapshot = http.send(HttpRequest.newBuilder(URI.create("http://127.0.0.2:" + (base - 1) + "/snapshot"))
                     .timeout(Duration.ofSeconds(2)).GET().build(), HttpResponse.BodyHandlers.ofString());
             assertEquals(200, snapshot.statusCode());
@@ -130,7 +162,7 @@ class KvcmEngineProcessTest {
                     .POST(HttpRequest.BodyPublishers.ofString(JSON.writeValueAsString(Map.of("engine", "prefill-0", "keys", Set.of(evicted)))))
                     .build(), HttpResponse.BodyHandlers.ofString());
             assertEquals(200, eviction.statusCode());
-            until(() -> owners.get(prefill).size() == 1);
+            until(() -> owners.get(prefill).size() == (preload ? 14 : 1));
             assertEquals(2, owners.get(decode).size());
             process.destroy();
             assertTrue(process.waitFor(8, TimeUnit.SECONDS));
