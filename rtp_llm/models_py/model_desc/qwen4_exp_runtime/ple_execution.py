@@ -19,6 +19,14 @@ from .ple_cache_views import PLECacheViews
 from .ple_transaction import PLETransactionCoordinator
 
 
+def ple_eos_token_id(config):
+    """Resolve the checkpoint's PLE document boundary, not the chat stop ID."""
+    eos = getattr(config, "_qwen4_ple_eos_token_id", None)
+    if eos is None:
+        eos = getattr(getattr(config, "special_tokens", None), "eos_token_id", None)
+    return eos
+
+
 class PLEExecution:
     def __init__(
         self,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
@@ -277,6 +278,13 @@ def _draft_incremental_prefill_geometry(
     # A completed group may read committed raw keys preceding the new rows.
     # Validate that source tail and every destination absolute state page.
     state_table_width = int(state_table.shape[1])
+    # Every invocation reads fresh device values. Copy the small table once
+    # instead of synchronizing for every physical block in a long chunk.
+    host_state_table = (
+        state_table.tolist()
+        if os.getenv("RTP_QWEN4_PREFILL_META_IMPL", "legacy") == "batched"
+        else None
+    )
     for request_idx, (prefix, length) in enumerate(zip(prefix_values, lengths)):
         first_needed = prefix - (prefix % ratio)
         logical_blocks = {
@@ -289,7 +297,11 @@ def _draft_incremental_prefill_geometry(
                     "QSA cache 'indexer_state' block table does not cover the "
                     "draft incremental tail"
                 )
-            block_id = int(state_table[request_idx, logical_block].item())
+            block_id = (
+                int(host_state_table[request_idx][logical_block])
+                if host_state_table is not None
+                else int(state_table[request_idx, logical_block].item())
+            )
             if block_id <= 0 or block_id >= int(state_pool.shape[0]):
                 raise RuntimeError(
                     "QSA cache 'indexer_state' draft incremental tail resolves "
